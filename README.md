@@ -1,14 +1,15 @@
 # FS Indexer
 
-A high-performance file system indexer with SQLite backend. This tool efficiently scans and indexes file system metadata, supporting both synchronous and asynchronous checksum calculation.
+A high-performance file system indexer with DuckDB backend. This tool efficiently scans and indexes file system metadata using asynchronous I/O and smart caching strategies.
 
 ## Features
 
-- Fast file system scanning
-- SQLite database for efficient storage and querying
-- Optional asynchronous checksum calculation using Redis
+- Fast file system scanning with async/await (~25K files/second)
+- DuckDB database for high-performance storage and querying
+- Smart directory caching and prefetching
+- Connection pooling and rate limiting
 - Configurable batch processing
-- Progress tracking and performance metrics
+- Detailed progress tracking and performance metrics
 
 ## Installation
 
@@ -26,15 +27,28 @@ pip install -e .
 ## Configuration
 
 Configure the indexer using `indexer-config.yaml`. Key settings include:
-- Source directory to index
-- SQLite database path
-- Checksum calculation mode (disabled/sync/async)
-- Redis configuration for async mode
-- Batch sizes and other performance settings
+
+### Performance Settings
+- DuckDB memory limit (default: 85% of system RAM)
+- Number of threads (default: 16)
+- Batch size for database operations (default: 100,000)
+- Read buffer size and mmap settings
+- LZ4 compression for better space efficiency
+
+### API Settings
+- Maximum concurrent requests (default: 5)
+- Cache TTL for directory contents (default: 60s)
+- Prefetch depth and batch size
+- Retry attempts and backoff delay
+
+### Skip Patterns
+- Directory patterns to skip
+- File patterns to skip
+- Extension-based filtering
 
 ## Usage
 
-### Command Line Arguments
+### Basic Usage
 
 ```bash
 # Show help
@@ -47,28 +61,36 @@ python -m fs_indexer.main --root-path /path/to/index
 python -m fs_indexer.main --config /path/to/config.yaml --root-path /path/to/index
 ```
 
-### Basic indexing (without checksums):
-```bash
-python -m fs_indexer.main
-```
-
-### With async checksum calculation:
-   
-a. Start the Redis server and worker process:
-```bash
-python -m fs_indexer.run_checksum_worker
-```
-
-b. In another terminal, run the main indexer:
-```bash
-python -m fs_indexer.main
-```
-
 The indexer will display progress and performance metrics during operation, including:
-- Files processed per second
+- Files processed per second (~25K/s on modern hardware)
 - Total size of indexed files
 - Number of files updated/skipped/removed
 - Any errors encountered
+
+## Performance Optimizations
+
+The indexer uses several strategies to achieve high performance:
+
+1. **Async I/O Operations**
+   - Async/await for API calls
+   - Connection pooling and rate limiting
+   - Retry logic with exponential backoff
+
+2. **Smart Caching**
+   - Directory content caching with TTL
+   - Intelligent prefetching of child directories
+   - Memory-efficient batch processing
+
+3. **DuckDB Optimizations**
+   - Memory-mapped I/O
+   - LZ4 compression
+   - Parallel query execution
+   - Optimized batch upserts
+
+4. **Resource Management**
+   - Dynamic batch sizing based on directory depth
+   - Controlled prefetching to prevent API overload
+   - Efficient memory usage with generators
 
 ## Building the Application
 
@@ -169,5 +191,3 @@ To run the standalone version:
 ```bash
 cd dist/fs-indexer-{platform}
 ./run-indexer.sh
-
-```
