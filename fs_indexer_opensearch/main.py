@@ -18,6 +18,8 @@ import asyncio
 from fs_indexer_opensearch.db_duckdb import init_database, bulk_upsert_files, cleanup_missing_files, get_database_stats
 from fs_indexer_opensearch.lucidlink_api import LucidLinkAPI
 from fs_indexer_opensearch.opensearch_integration import OpenSearchClient
+import urllib.parse
+import requests
 
 # Initialize basic logging first
 logger = logging.getLogger(__name__)
@@ -356,15 +358,15 @@ def process_files(session: duckdb.DuckDBPyConnection, files: List[Dict], stats: 
         raise
 
 def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowStats, config: Dict[str, Any]) -> None:
-    """Process files using LucidLink API."""
+    """Process files from LucidLink and index them."""
     try:
+        # Initialize LucidLink API
         logger.info("Initializing LucidLink API...")
+        logger.info(f"LucidLink config: {config['lucidlink_filespace']}")
         
         # Initialize API with parallel workers
         max_workers = config.get('performance', {}).get('max_workers', 10)
         port = config.get('lucidlink_filespace', {}).get('port', 9778)
-        logger.info(f"LucidLink config: {config.get('lucidlink_filespace', {})}")
-        logger.info(f"Connecting to LucidLink API on port {port}")
         
         async def process_files_async():
             async with LucidLinkAPI(port=port, max_workers=max_workers) as api:
@@ -372,6 +374,7 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                 
                 # Initialize variables for batch processing
                 batch = []
+                current_files = []  # Track current files for cleanup
                 files_in_batch = 0
                 skip_patterns = config.get('skip_patterns', {})
                 batch_size = config['performance']['batch_size']
@@ -399,8 +402,9 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                             'last_error': None
                         }
                         
-                        # Add to batch
+                        # Add to batch and track current files
                         batch.append(db_entry)
+                        current_files.append({'id': file_info['id']})
                         files_in_batch += 1
                         
                         # Process batch if it reaches the configured size
@@ -422,10 +426,10 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                     logger.info(f"Processing final batch of {len(batch)} items...")
                     bulk_upsert_files(session, batch)
                     stats.files_updated += files_in_batch
-                    
+                
                 # Clean up items that no longer exist
                 logger.info("Cleaning up removed files...")
-                cleanup_missing_files(session, batch)
+                cleanup_missing_files(session, current_files)
         
         # Run the async function to complete DuckDB indexing
         asyncio.run(process_files_async())
@@ -433,31 +437,57 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
         # After DuckDB indexing is complete, send to OpenSearch
         logger.info("DuckDB indexing complete, sending data to OpenSearch...")
         send_data_to_opensearch(session, config)
-        logger.info("OpenSearch indexing complete")
         
     except Exception as e:
-        error_msg = f"Error in LucidLink file processing: {e}"
+        error_msg = f"Error in LucidLink file processing: {str(e)}"
         logger.error(error_msg)
         stats.add_error(error_msg)
         raise
 
-def format_size(size_bytes: int) -> str:
-    """Convert size in bytes to human readable string."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024.0:
-            # Use 2 decimal places, but strip trailing zeros and decimal point if not needed
-            return f"{size_bytes:.2f}".rstrip('0').rstrip('.') + f" {unit}"
-        size_bytes /= 1024.0
-    return f"{size_bytes:.2f} TB"
-
 def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str, Any]) -> None:
     """Send file data from DuckDB to OpenSearch."""
+    from fs_indexer_opensearch.opensearch_integration import OpenSearchClient
+    
     client = OpenSearchClient(
         host=config['opensearch']['host'],
         port=config['opensearch']['port'],
         username=config['opensearch']['username'],
         password=config['opensearch']['password']
     )
+
+    # Initialize direct link API client
+    lucidlink_port = config['lucidlink_filespace'].get('port', 9778)
+    api_base_url = f"http://127.0.0.1:{lucidlink_port}"
+    
+    def get_direct_link(filepath: str, is_directory: bool = False) -> Optional[str]:
+        """Generate a direct link for a file using the LucidLink API."""
+        try:
+            # Remove leading slash and ensure proper path format
+            rel_path = filepath.lstrip("/")
+            
+            # API endpoint and parameters
+            endpoint = "fsEntry/direct-link"
+            params = {
+                "path": rel_path,
+                "isDirectory": is_directory
+            }
+            
+            # Make API request
+            response = requests.get(
+                f"{api_base_url}/{endpoint}",
+                params=params,
+                timeout=10
+            )
+            
+            # Raise for non-200 responses
+            response.raise_for_status()
+            
+            # Extract direct link from response
+            return response.json().get("result")
+            
+        except Exception as e:
+            logger.error(f"Error generating direct link for {filepath}: {str(e)}")
+            return None
     
     # Read files from DuckDB in batches
     batch_size = config['performance']['batch_size']
@@ -479,6 +509,10 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
         # Prepare bulk data for OpenSearch
         bulk_data = []
         for row in results:
+            # Generate direct link for the file
+            is_directory = row[2] == 'directory'  # row[2] is the type
+            direct_link = get_direct_link(row[1], is_directory)  # row[1] is the filepath
+            
             # Map database fields to OpenSearch fields
             doc = {
                 "filepath": row[1],  # name field
@@ -488,7 +522,8 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
                 "creation_time": row[4].isoformat(),
                 "modified_time": row[5].isoformat(),
                 "type": row[2],  # Use type instead of file_type
-                "indexed_time": datetime.now(timezone.utc).isoformat()
+                "indexed_time": datetime.now(timezone.utc).isoformat(),
+                "direct_link": direct_link
             }
             
             # Add the index action and document
@@ -503,6 +538,15 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
             logger.info(f"Sent batch of {len(results)} files to OpenSearch")
         
         offset += batch_size
+
+def format_size(size_bytes: int) -> str:
+    """Convert size in bytes to human readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            # Use 2 decimal places, but strip trailing zeros and decimal point if not needed
+            return f"{size_bytes:.2f}".rstrip('0').rstrip('.') + f" {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} TB"
 
 def log_workflow_summary(stats: WorkflowStats) -> None:
     """Log a summary of the workflow execution."""

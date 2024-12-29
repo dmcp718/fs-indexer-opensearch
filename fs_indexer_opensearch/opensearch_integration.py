@@ -72,7 +72,16 @@ class OpenSearchClient:
                     "modified_time": {"type": "date"},
                     "creation_time": {"type": "date"},
                     "type": {"type": "keyword"},
-                    "indexed_time": {"type": "date"}
+                    "indexed_time": {"type": "date"},
+                    "direct_link": {
+                        "type": "keyword",
+                        "meta": {
+                            "fieldType": "string",
+                            "openLinkInNewTab": "false",
+                            "labelTemplate": "link to asset",
+                            "urlTemplate": "{{value}}"
+                        }
+                    }
                 }
             }
         }

@@ -93,38 +93,29 @@ def bulk_upsert_files(conn: duckdb.DuckDBPyConnection, files_batch: List[Dict[st
         logger.error(f"Bulk upsert failed: {str(e)}")
         raise
 
-def cleanup_missing_files(conn: duckdb.DuckDBPyConnection, current_files: List[Dict[str, Any]]) -> int:
-    """Remove files from database that are no longer present in the filesystem."""
+def cleanup_missing_files(session: duckdb.DuckDBPyConnection, current_files: List[Dict[str, str]]) -> None:
+    """Remove files from the database that no longer exist in the filesystem."""
     try:
-        # Create temporary table for current files
-        conn.execute("""
-            CREATE TEMPORARY TABLE IF NOT EXISTS current_files (
-                id VARCHAR PRIMARY KEY
-            );
+        # Convert current files to DataFrame
+        df = pd.DataFrame([{'id': f['id']} for f in current_files])
+        
+        if df.empty:
+            logger.warning("No current files provided for cleanup")
+            return
+            
+        # Create temporary table with current file IDs
+        session.execute("CREATE TEMP TABLE IF NOT EXISTS current_files (id STRING)")
+        session.register("current_files_df", df)
+        session.execute("INSERT INTO current_files SELECT id FROM current_files_df")
+        
+        # Delete files that don't exist in current_files
+        session.execute("""
+            DELETE FROM lucidlink_files
+            WHERE id NOT IN (SELECT id FROM current_files)
         """)
         
-        # Clear any existing data
-        conn.execute("DELETE FROM current_files;")
-        
-        # Insert current file IDs
-        df = pd.DataFrame([{'id': f['id']} for f in current_files])
-        conn.execute("INSERT INTO current_files SELECT * FROM df")
-        
-        # Delete files not in current_files
-        result = conn.execute("""
-            WITH to_delete AS (
-                SELECT id FROM lucidlink_files 
-                WHERE id NOT IN (SELECT id FROM current_files)
-            )
-            DELETE FROM lucidlink_files 
-            WHERE id IN (SELECT id FROM to_delete)
-            RETURNING *;
-        """).fetchall()
-        
-        # Clean up temporary table
-        conn.execute("DROP TABLE current_files")
-        
-        return len(result)
+        # Drop temporary table
+        session.execute("DROP TABLE IF EXISTS current_files")
         
     except Exception as e:
         logger.error(f"Cleanup failed: {str(e)}")
