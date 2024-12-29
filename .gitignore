@@ -46,3 +46,5 @@ run_logs/
 
 # Project specific
 test_files/
+data/
+*.db

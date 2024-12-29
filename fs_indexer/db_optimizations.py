@@ -12,7 +12,7 @@ from sqlalchemy import text, Engine, select, insert, update, delete, case
 from sqlalchemy.orm import Session
 
 # Import indexed_files table from schema to avoid circular import
-from .schema import indexed_files
+from .schema import indexed_files, lucidlink_files
 
 def optimize_connection_pool(engine: Engine, config: Dict) -> Engine:
     """Configure database connection pool settings."""
@@ -55,41 +55,51 @@ def get_table_statistics(session: Session) -> Dict[str, Any]:
         
         return stats
 
-def bulk_upsert_files(session: Session, files_batch: List[Dict[str, Any]]) -> int:
-    """Perform optimized bulk upsert of files."""
+def bulk_upsert_files(session: Session, files_batch: List[Dict[str, Any]], table='indexed_files') -> int:
+    """Perform optimized bulk upsert of files.
+    
+    Args:
+        session: SQLAlchemy session
+        files_batch: List of file dictionaries to upsert
+        table: Table name to upsert into ('indexed_files' or 'lucidlink_files')
+        
+    Returns:
+        Number of files processed
+    """
     if not files_batch:
         return 0
-    
-    # Prepare values for bulk insert/update
-    values = []
-    now = datetime.now(timezone.utc)
-    
-    for file_info in files_batch:
-        values.append({
-            "rel_path": file_info["rel_path"],
-            "size": file_info["size"],
-            "modified_at": datetime.fromtimestamp(file_info["mtime"], tz=timezone.utc),  
-            "indexed_at": now,
-            "error_count": 0,
-            "status": "completed"
-        })
-    
-    # Use INSERT OR REPLACE for better performance
-    stmt = text("""
-        INSERT OR REPLACE INTO indexed_files 
-        (rel_path, size, modified_at, indexed_at, error_count, status)
-        VALUES (:rel_path, :size, :modified_at, :indexed_at, :error_count, :status)
-    """)
-    
-    # Execute in chunks to avoid SQLite variable limit
-    chunk_size = 999  # SQLite default max variables is 999
-    processed = 0
-    for i in range(0, len(values), chunk_size):
-        chunk = values[i:i + chunk_size]
-        session.execute(stmt, chunk)
-        processed += len(chunk)
-    
-    return processed
+        
+    try:
+        # Use raw SQL with INSERT OR REPLACE for better performance
+        if table == 'indexed_files':
+            stmt = text("""
+                INSERT OR REPLACE INTO indexed_files 
+                (rel_path, size, modified_at, checksum, indexed_at, error_count, last_error, status)
+                VALUES (:rel_path, :size, :modified_at, :checksum, :indexed_at, :error_count, :last_error, :status)
+            """)
+        else:  # lucidlink_files
+            stmt = text("""
+                INSERT OR REPLACE INTO lucidlink_files 
+                (id, name, type, size, creation_time, update_time, indexed_at, error_count, last_error)
+                VALUES (:id, :name, :type, :size, :creation_time, :update_time, :indexed_at, :error_count, :last_error)
+            """)
+            
+        # Execute in chunks to avoid SQLite variable limit
+        chunk_size = 999  # SQLite default max variables is 999
+        processed = 0
+        
+        for i in range(0, len(files_batch), chunk_size):
+            chunk = files_batch[i:i + chunk_size]
+            session.execute(stmt, chunk)
+            processed += len(chunk)
+            
+        session.commit()
+        return processed
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Bulk upsert failed: {str(e)}")
+        raise
 
 def check_missing_files(session: Session, root_path: Path) -> Tuple[int, List[str]]:
     """Check for files in database that no longer exist on disk.

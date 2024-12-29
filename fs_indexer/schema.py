@@ -63,3 +63,18 @@ indexing_errors = Table(
     Column('batch_id', String, nullable=False),
     Column('retry_count', Integer, server_default='0', nullable=False)
 )
+
+# Table for LucidLink files
+lucidlink_files = Table(
+    'lucidlink_files',
+    metadata,
+    Column('id', String, nullable=False),  # LucidLink file/directory ID
+    Column('name', String, primary_key=True),  # Full path name
+    Column('type', String, nullable=False),  # 'file' or 'directory'
+    Column('size', Integer, nullable=False),
+    Column('creation_time', DateTime(timezone=True), nullable=False),
+    Column('update_time', DateTime(timezone=True), nullable=False),
+    Column('indexed_at', DateTime(timezone=True), server_default=func.now(), nullable=False),
+    Column('last_error', Text),
+    Column('error_count', Integer, default=0)
+)

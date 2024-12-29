@@ -19,8 +19,13 @@
 # Monitor the worker logs for progress and any errors
 # =============================================
 
+lucidlink_filespace: true
+filespace_port: 9778
+
+# =============================================
+
 # Root path to start indexing from (optional, can be provided via --root-path argument)
-# root_path: ./data
+root_path: "/Volumes/dmpfs/production"
 
 # Database configuration
 database:
@@ -78,8 +83,9 @@ check_missing_files: false
 logging:
   log_dir: ./logs
   filename: "fs_indexer.log"
-  level: "INFO"  # Set to DEBUG for more detailed logs
-  format: "%(asctime)s - %(levelname)s - %(message)s"
+  level: DEBUG  # Set to DEBUG for more verbose output
+  format: '%(asctime)s - %(levelname)s - %(message)s'
+  file: 'indexer.log'
   rotation:
     max_bytes: 10485760  # 10MB
     backup_count: 5
@@ -113,8 +119,13 @@ skip_patterns:
     - "__pycache__"
     - "node_modules"
     - "venv"
+    - ".venv"
     - "env"
     - ".env"
+    # - "test_files"
+    # - "Godzilla_2K"
+    # - "Godzilla_10K_tif"
+
   
   # Skip hidden files (starting with .)
   skip_hidden: true

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-import xxhash
+# import xxhash  # Temporarily commented out as not needed for LucidLink API
 import yaml
 import subprocess
 import atexit
@@ -18,9 +18,9 @@ import redis
 import argparse
 from queue import Queue, Empty
 from threading import Thread, Event, Lock
-from sqlalchemy import create_engine, select, delete
+from sqlalchemy import create_engine, select, delete, func, text
 from sqlalchemy.orm import sessionmaker, Session
-from fs_indexer.schema import metadata, indexed_files
+from fs_indexer.schema import metadata, indexed_files, lucidlink_files
 from fs_indexer.db_optimizations import (
     optimize_connection_pool,
     configure_sqlite,
@@ -28,6 +28,7 @@ from fs_indexer.db_optimizations import (
     bulk_upsert_files,
     check_missing_files
 )
+from fs_indexer.lucidlink_api import LucidLinkAPI
 
 # Initialize basic logging first
 logger = logging.getLogger(__name__)
@@ -130,7 +131,9 @@ class WorkflowStats:
     """Track workflow statistics."""
     def __init__(self):
         self.start_time = time.time()
+        self.end_time = None
         self.total_files = 0
+        self.total_dirs = 0  # Track number of directories
         self.files_updated = 0
         self.files_skipped = 0
         self.files_removed = 0
@@ -147,7 +150,11 @@ class WorkflowStats:
         """Add information about removed files."""
         self.files_removed = count
         self.removed_paths = paths
-
+        
+    def finish(self):
+        """Mark the workflow as finished and set end time."""
+        self.end_time = time.time()
+        
 def should_skip_file(file_path: Path, config: Dict[str, Any]) -> bool:
     """Check if a file should be skipped based on configuration."""
     # Check if file is in a skipped directory
@@ -176,18 +183,18 @@ def calculate_checksum(file_path: str, buffer_size: int = 131072) -> str:
             logger.error(f"Permission denied: Unable to access file for checksum calculation: {file_path}")
             raise PermissionError(f"No read access to file: {file_path}")
             
-        hasher = xxhash.xxh64()
-        with open(file_path, "rb") as f:
-            try:
-                while True:
-                    data = f.read(buffer_size)
-                    if not data:
-                        break
-                    hasher.update(data)
-                return hasher.hexdigest()
-            except IOError as e:
-                logger.error(f"Error reading file during checksum calculation: {file_path}: {str(e)}")
-                raise
+        # hasher = xxhash.xxh64()
+        # with open(file_path, "rb") as f:
+        #     try:
+        #         while True:
+        #             data = f.read(buffer_size)
+        #             if not data:
+        #                 break
+        #             hasher.update(data)
+        #         return hasher.hexdigest()
+        #     except IOError as e:
+        #         logger.error(f"Error reading file during checksum calculation: {file_path}: {str(e)}")
+        #         raise
     except Exception as e:
         logger.error(f"Failed to calculate checksum for {file_path}: {str(e)}")
         raise
@@ -392,6 +399,99 @@ def process_files(session: Session, files: List[Dict], stats: WorkflowStats, con
         stats.add_error(error_msg)
         raise
 
+def process_lucidlink_files(session: Session, stats: WorkflowStats, config: Dict[str, Any]) -> None:
+    """Process files using LucidLink API"""
+    try:
+        print("Indexing started...")
+        
+        api = LucidLinkAPI(config['filespace_port'])
+        
+        # Get skip directories from config
+        skip_directories = config.get('skip_patterns', {}).get('directories', [])
+        
+        # Create a batch for bulk database updates
+        batch = []
+        files_in_batch = 0  # Track actual files in batch
+        batch_size = config['batch_size']
+        now = datetime.now(timezone.utc)
+        
+        # Keep track of all processed items for cleanup
+        processed_items = set()
+        
+        for file_info in api.traverse_filesystem(skip_directories=skip_directories):
+            try:
+                # Add to processed set
+                processed_items.add(file_info['name'])
+                
+                # Convert API response to database format
+                db_entry = {
+                    'id': file_info['id'],
+                    'name': file_info['name'],  # This is the full path name (primary key)
+                    'type': file_info['type'].lower(),  # Normalize type to lowercase
+                    'size': file_info['size'],
+                    'creation_time': file_info['creation_time'],
+                    'update_time': file_info['update_time'],
+                    'indexed_at': now,
+                    'error_count': 0,
+                    'last_error': None
+                }
+                
+                batch.append(db_entry)
+                
+                # Track stats based on normalized type
+                if db_entry['type'] == 'file':
+                    stats.total_files += 1
+                    stats.total_size += db_entry['size']
+                    files_in_batch += 1
+                elif db_entry['type'] == 'directory':
+                    stats.total_dirs += 1
+                else:
+                    logger.warning(f"Unknown type '{db_entry['type']}' for {db_entry['name']}")
+                
+                # Process batch if it reaches the configured size
+                if len(batch) >= batch_size:
+                    bulk_upsert_files(session, batch, table='lucidlink_files')
+                    stats.files_updated += files_in_batch  # Only count actual files
+                    batch = []
+                    files_in_batch = 0
+                    
+            except Exception as e:
+                error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
+                logger.error(error_msg)
+                stats.add_error(error_msg)
+                continue
+                
+        # Process any remaining files in the final batch
+        if batch:
+            bulk_upsert_files(session, batch, table='lucidlink_files')
+            stats.files_updated += files_in_batch  # Only count actual files
+            
+        # Clean up items that no longer exist
+        if processed_items:
+            # Convert set to list and chunk into groups of 999 (SQLite limit)
+            items_list = list(processed_items)
+            chunk_size = 999
+            
+            for i in range(0, len(items_list), chunk_size):
+                chunk = items_list[i:i + chunk_size]
+                placeholders = ','.join(':param' + str(i) for i in range(len(chunk)))
+                params = {f'param{i}': chunk[i] for i in range(len(chunk))}
+                cleanup_query = text(f"""
+                    DELETE FROM lucidlink_files 
+                    WHERE name NOT IN ({placeholders})
+                """)
+                session.execute(cleanup_query, params)
+                
+            session.commit()
+            
+        print("Indexing complete!")
+            
+    except Exception as e:
+        error_msg = f"Error in LucidLink file processing: {str(e)}"
+        logger.error(error_msg)
+        stats.add_error(error_msg)
+        raise
+
 def start_redis_server():
     """Start the local Redis server."""
     try:
@@ -443,13 +543,21 @@ def stop_redis_server(redis_process):
         logger.info("Redis server stopped")
 
 def log_workflow_summary(stats: WorkflowStats) -> None:
-    """Log a summary of the workflow."""
+    """Log a summary of the workflow execution."""
+    # Set end time if not already set
+    if stats.end_time is None:
+        stats.finish()
+        
+    elapsed_time = stats.end_time - stats.start_time
+    processing_rate = stats.total_files / elapsed_time if elapsed_time > 0 else 0
+    
     logger.info("=" * 80)
-    logger.info("Workflow Summary:")
-    logger.info(f"Time Elapsed:     {stats.end_time - stats.start_time:.2f} seconds")
-    logger.info(f"Processing Rate:  {stats.total_files / (stats.end_time - stats.start_time):.1f} files/second")
+    logger.info("Indexer Summary:")
+    logger.info(f"Time Elapsed:     {elapsed_time:.2f} seconds")
+    logger.info(f"Processing Rate:  {processing_rate:.1f} files/second")
     logger.info(f"Total Size:       {stats.total_size / (1024.0 ** 3):.4f} GB")
     logger.info(f"Total Files:      {stats.total_files}")
+    logger.info(f"Total Dirs:       {stats.total_dirs}")
     logger.info(f"Files Updated:    {stats.files_updated}")
     logger.info(f"Files Skipped:    {stats.files_skipped}")
     logger.info(f"Files Removed:    {stats.files_removed}")
@@ -473,84 +581,55 @@ def get_database_stats(session: Session) -> Dict[str, Any]:
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(description='File System Indexer')
+    parser.add_argument('--config', help='Path to config file')
+    parser.add_argument('--root-path', help='Root path to index')
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = load_config(args.config)
+    configure_logging(config)
+    
+    # Override root path if provided via command line
+    if args.root_path:
+        config['root_path'] = args.root_path
+        
+    # Initialize database
+    engine = create_engine(
+        config['database']['connection']['url'],
+        **config['database']['connection'].get('options', {})
+    )
+    
+    if 'sqlite' in config['database']['connection']['url']:
+        configure_sqlite(engine)
+        
+    metadata.create_all(engine)
+    optimize_connection_pool(engine, config)
+    Session = sessionmaker(bind=engine)
+    
     try:
-        # Parse command line arguments
-        parser = argparse.ArgumentParser(description='File System Indexer')
-        parser.add_argument('--root-path', type=str, help='Root path to start indexing from')
-        parser.add_argument('--config', type=str, help='Path to config file')
-        args = parser.parse_args()
-        
-        # Load config and override root_path if provided via command line
-        global CONFIG
-        CONFIG = load_config(args.config if args.config else None)
-        
-        if args.root_path:
-            CONFIG['root_path'] = args.root_path
-        elif 'root_path' not in CONFIG:
-            parser.error('Root path must be provided either via --root-path argument or in config file')
-        
-        # Configure logging with full settings from config
-        configure_logging(CONFIG)
-        
-        logger.info("Starting workflow...")
-        logger.info(f"Starting indexing from: {CONFIG['root_path']}")
-        logger.info(f"Checksum mode: {CONFIG.get('checksum_mode', 'disabled')}")
-        
-        stats = WorkflowStats()
-        root_path = Path(CONFIG["root_path"])
-        
-        # Initialize database session
-        engine = create_engine(CONFIG["database"]["connection"]["url"])
-        engine = optimize_connection_pool(engine, CONFIG)
-        
-        # Configure SQLite for better performance
-        if engine.url.drivername == "sqlite":
-            configure_sqlite(engine)
-        
-        # Create tables and indexes
-        metadata.create_all(engine)
-        
-        Session = sessionmaker(bind=engine)
-        session = Session()
-        
-        try:
-            # Initialize queue and worker thread
-            file_queue = Queue(maxsize=500000)  # Buffer up to 500K files
-            stop_event = Event()
-            worker_thread = Thread(
-                target=process_files_worker,
-                args=(file_queue, stop_event, session, stats, CONFIG)
-            )
-            worker_thread.start()
+        with Session() as session:
+            stats = WorkflowStats()
             
-            # Process files as they're scanned
-            stats.total_files = 0
-            for file_info in scan_directory_parallel(root_path, CONFIG, max_workers=CONFIG["max_workers"]):
-                stats.total_files += 1
-                file_queue.put(file_info)
-            
-            # Signal worker to stop and wait for completion
-            stop_event.set()
-            worker_thread.join()
-            
-            # Check for missing files if enabled
-            if CONFIG.get("check_missing_files", False):
-                logger.info("Checking for missing files...")
-                removed_count, removed_paths = check_missing_files(session, root_path)
-                stats.add_removed_files(removed_count, removed_paths)
-            
-            # Log workflow summary
-            stats.end_time = time.time()
+            if config.get('lucidlink_filespace', False):
+                # Use LucidLink API for file processing
+                process_lucidlink_files(session, stats, config)
+            else:
+                # Use traditional file system traversal
+                files_generator = scan_directory_parallel(
+                    Path(config['root_path']),
+                    config,
+                    config.get('max_workers', 8)
+                )
+                process_files(session, files_generator, stats, config)
+                
+            session.commit()
+            stats.finish()
+            print()  # Add newline before summary
             log_workflow_summary(stats)
             
-        except Exception as e:
-            logger.error(f"Error in workflow: {e}")
-            raise
-        finally:
-            session.close()
-            
     except Exception as e:
-        logger.error(f"Error in main: {e}")
+        logger.error(f"Indexing failed: {str(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -1,0 +1,74 @@
+[
+    {
+        "creationTime" : 1731007607091043000,
+        "id" : "3:6",
+        "name" : "\/Videos",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1731007607091043000
+    },
+    {
+        "creationTime" : 1735282484498447000,
+        "id" : "13:24146",
+        "name" : "\/test_files",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1735282484498447000
+    },
+    {
+        "creationTime" : 1731513485868438220,
+        "id" : "8:336",
+        "name" : "\/00_Media",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1713896424792154800
+    },
+    {
+        "creationTime" : 1663088927174969400,
+        "id" : "13:12012",
+        "name" : "\/Adobe_MAX",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1663088927174969400
+    },
+    {
+        "creationTime" : 1735259113858211000,
+        "id" : "13:12099",
+        "name" : "\/logs",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1735259113858211000
+    },
+    {
+        "creationTime" : 1720449482965106900,
+        "id" : "13:12112",
+        "name" : "\/Godzilla_2K",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1720449482965106900
+    },
+    {
+        "creationTime" : 1731006419171264000,
+        "id" : "3:1",
+        "name" : "\/.DS_Store",
+        "size" : 14340,
+        "type" : "file",
+        "updateTime" : 1735480142632455001
+    },
+    {
+        "creationTime" : 1734978646844964000,
+        "id" : "4294967289:0",
+        "name" : "\/.lucid_audit",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1734978646844964000
+    },
+    {
+        "creationTime" : 1711109951941118900,
+        "id" : "13:14115",
+        "name" : "\/Godzilla_10K_tif",
+        "size" : 0,
+        "type" : "directory",
+        "updateTime" : 1711109951941118900
+    }
+]
