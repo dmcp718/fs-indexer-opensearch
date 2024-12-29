@@ -100,6 +100,12 @@ exe = EXE(
 
     # Copy executable and create run script
     shutil.copy2(dist_dir / 'fs-indexer', platform_dir)
+    
+    # Copy config file
+    config_dir = platform_dir / 'fs_indexer'
+    config_dir.mkdir(exist_ok=True)
+    shutil.copy2(config_file, config_dir)
+    
     run_script = platform_dir / 'run-indexer.sh'
     run_script.write_text('#!/bin/bash\n./fs-indexer "$@"\n')
     run_script.chmod(0o755)
