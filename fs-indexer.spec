@@ -1,9 +1,8 @@
-
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
     ['fs_indexer/main.py'],
-    pathex=['/Users/davidphillips/Documents/1_Projects/LucidLink/FS_OpenSearch_index_search/fs-indexer-migrator-dbos/fs-indexer'],
+    pathex=['/Users/davidphillips/Documents/1_Projects/LucidLink/fs-indexer-lucidlink'],
     binaries=[],
     datas=[
         ('fs_indexer/indexer-config.yaml', 'fs_indexer'),
@@ -11,10 +10,9 @@ a = Analysis(
         ('fs_indexer/db_optimizations.py', 'fs_indexer'),
     ],
     hiddenimports=[
-        'sqlalchemy',
-        'sqlalchemy.sql.default_comparator',
+        'duckdb',
+        'aiohttp',
         'yaml',
-        'redis',
         'fs_indexer.schema',
         'fs_indexer.db_optimizations',
     ],
@@ -25,12 +23,13 @@ a = Analysis(
     noarchive=False,
 )
 
-pyz = PYZ(a.pure)
+pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
+    a.zipfiles,
     a.datas,
     [],
     name='fs-indexer',
