@@ -27,7 +27,7 @@ lucidlink_filespace:
 # =============================================
 
 # Root path to start indexing from (optional, can be provided via --root-path argument)
-root_path: "/Volumes/dmpfs/production"
+root_path: "<YOUR_ROOT_PATH_HERE>"
 
 # Database configuration
 database:

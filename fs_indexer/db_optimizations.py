@@ -29,16 +29,20 @@ def configure_sqlite(engine: Engine) -> None:
     with engine.connect() as conn:
         # Set journal mode to WAL for better concurrency
         conn.execute(text("PRAGMA journal_mode=WAL"))
-        # Set synchronous mode for better performance
-        conn.execute(text("PRAGMA synchronous=NORMAL"))
-        # Set cache size to 256MB (value in pages, -256000 = 256MB)
-        conn.execute(text("PRAGMA cache_size=-256000"))
-        # Enable memory-mapped I/O for better performance
-        conn.execute(text("PRAGMA mmap_size=1073741824"))  # 1GB
+        # Set synchronous mode to OFF for maximum performance (data is still safe with WAL)
+        conn.execute(text("PRAGMA synchronous=OFF"))
+        # Set cache size to 1GB (value in pages, -1024000 = 1GB)
+        conn.execute(text("PRAGMA cache_size=-1024000"))
+        # Enable memory-mapped I/O for better performance (4GB)
+        conn.execute(text("PRAGMA mmap_size=4294967296"))
         # Set temp store to memory for better performance
         conn.execute(text("PRAGMA temp_store=MEMORY"))
         # Enable foreign key support
         conn.execute(text("PRAGMA foreign_keys=ON"))
+        # Set page size to 32KB for better sequential I/O
+        conn.execute(text("PRAGMA page_size=32768"))
+        # Set locking mode to EXCLUSIVE for better write performance
+        conn.execute(text("PRAGMA locking_mode=EXCLUSIVE"))
         conn.commit()
 
 def get_table_statistics(session: Session) -> Dict[str, Any]:

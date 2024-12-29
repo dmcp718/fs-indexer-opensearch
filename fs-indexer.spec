@@ -1,3 +1,4 @@
+
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
@@ -5,9 +6,9 @@ a = Analysis(
     pathex=['/Users/davidphillips/Documents/1_Projects/LucidLink/fs-indexer-lucidlink'],
     binaries=[],
     datas=[
-        ('fs_indexer/indexer-config.yaml', 'fs_indexer'),
-        ('fs_indexer/schema.py', 'fs_indexer'),
-        ('fs_indexer/db_optimizations.py', 'fs_indexer'),
+        ('fs_indexer/indexer-config.yaml', '.'),
+        ('fs_indexer/schema.py', '.'),
+        ('fs_indexer/db_optimizations.py', '.'),
     ],
     hiddenimports=[
         'duckdb',

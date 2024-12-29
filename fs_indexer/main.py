@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """Load configuration from file."""
     if not config_path:
-        config_path = os.path.join(os.path.dirname(__file__), 'indexer-config.yaml')
+        # First try current directory
+        if os.path.exists('indexer-config.yaml'):
+            config_path = 'indexer-config.yaml'
+        else:
+            # Fall back to package directory
+            config_path = os.path.join(os.path.dirname(__file__), 'indexer-config.yaml')
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -454,42 +459,38 @@ def get_database_stats(session: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='File System Indexer')
-    parser.add_argument('--config', help='Path to config file')
-    parser.add_argument('--root-path', help='Root path to index')
+    parser = argparse.ArgumentParser(description='File Indexer')
+    parser.add_argument('--config', type=str, help='Path to the configuration file')
+    parser.add_argument('--root-path', type=str, help='Root path to start indexing from')
     args = parser.parse_args()
-    
+
     # Load configuration
     config = load_config(args.config)
+
+    # Configure logging
     configure_logging(config)
-    
-    # Override root path if provided via command line
+
+    # Check if root_path is provided
+    if not args.root_path and config.get('root_path') == '<YOUR_ROOT_PATH_HERE>':
+        print("Error: No root path provided. Please specify a root path using --root-path or in the config file.")
+        sys.exit(1)
+
+    # Override root_path if provided as an argument
     if args.root_path:
         config['root_path'] = args.root_path
-        
-    # Initialize database
-    db_path = os.path.join(os.path.dirname(__file__), 'fs_index.duckdb')
-    conn = init_database(db_path)
-    
-    try:
-        # Initialize stats
-        stats = WorkflowStats()
-        
-        # Process files
-        process_lucidlink_files(conn, stats, config)
-        
-        # Log summary
-        stats.finish()
-        log_workflow_summary(stats)
-        
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Error in main workflow: {str(e)}")
-        sys.exit(1)
-    finally:
-        conn.close()
+
+    # Initialize database connection
+    session = init_database(config['database']['connection']['url'])
+
+    # Initialize workflow stats
+    stats = WorkflowStats()
+
+    # Process files
+    process_lucidlink_files(session, stats, config)
+
+    # Log workflow summary
+    stats.finish()
+    log_workflow_summary(stats)
 
 if __name__ == "__main__":
     main()

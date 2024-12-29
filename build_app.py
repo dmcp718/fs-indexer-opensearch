@@ -24,6 +24,7 @@ def build_app():
     build_dir = root_dir / 'build'
     config_file = root_dir / 'fs_indexer' / 'indexer-config.yaml'
     pyinstaller_path = root_dir / 'venv' / 'bin' / 'pyinstaller'
+    platform_dir = dist_dir / f'fs-indexer-{system}'
 
     # Clean previous builds
     for dir_path in (dist_dir, build_dir):
@@ -39,9 +40,9 @@ a = Analysis(
     pathex=['{root_dir}'],
     binaries=[],
     datas=[
-        ('fs_indexer/indexer-config.yaml', 'fs_indexer'),
-        ('fs_indexer/schema.py', 'fs_indexer'),
-        ('fs_indexer/db_optimizations.py', 'fs_indexer'),
+        ('fs_indexer/indexer-config.yaml', '.'),
+        ('fs_indexer/schema.py', '.'),
+        ('fs_indexer/db_optimizations.py', '.'),
     ],
     hiddenimports=[
         'duckdb',
@@ -54,9 +55,6 @@ a = Analysis(
     hooksconfig={{}},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=None,
     noarchive=False,
 )
 
@@ -90,22 +88,19 @@ exe = EXE(
     spec_file.write_text(spec_content)
 
     # Run PyInstaller
-    run_command([str(pyinstaller_path), '--clean', str(spec_file)])
+    pyinstaller_cmd = [
+        str(pyinstaller_path),
+        '--clean',
+        f'--distpath={platform_dir}',
+        str(spec_file)
+    ]
+    print(f"Running: {' '.join(pyinstaller_cmd)}")
+    subprocess.run(pyinstaller_cmd, check=True)
 
-    # Create platform-specific directory
-    platform_dir = dist_dir / f'fs-indexer-{system}'
-    if platform_dir.exists():
-        shutil.rmtree(platform_dir)
-    platform_dir.mkdir(parents=True)
+    # Copy config file to output directory
+    shutil.copy2(config_file, platform_dir / 'indexer-config.yaml')
 
-    # Copy executable and create run script
-    shutil.copy2(dist_dir / 'fs-indexer', platform_dir)
-    
-    # Copy config file
-    config_dir = platform_dir / 'fs_indexer'
-    config_dir.mkdir(exist_ok=True)
-    shutil.copy2(config_file, config_dir)
-    
+    # Create run script
     run_script = platform_dir / 'run-indexer.sh'
     run_script.write_text('#!/bin/bash\n./fs-indexer "$@"\n')
     run_script.chmod(0o755)
