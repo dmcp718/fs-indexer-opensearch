@@ -44,10 +44,9 @@ a = Analysis(
         ('fs_indexer/db_optimizations.py', 'fs_indexer'),
     ],
     hiddenimports=[
-        'sqlalchemy',
-        'sqlalchemy.sql.default_comparator',
+        'duckdb',
+        'aiohttp',
         'yaml',
-        'redis',
         'fs_indexer.schema',
         'fs_indexer.db_optimizations',
     ],
@@ -99,15 +98,11 @@ exe = EXE(
         shutil.rmtree(platform_dir)
     platform_dir.mkdir(parents=True)
 
-    # Move files to platform directory
-    shutil.move(str(dist_dir / 'fs-indexer'), str(platform_dir))
-    shutil.copy2(str(config_file), str(platform_dir))
-
-    # Create run script
-    run_script = platform_dir / ('run-indexer.sh' if system != 'windows' else 'run-indexer.bat')
-    run_script.write_text('#!/bin/bash\n./fs-indexer "$@"\n' if system != 'windows' else '@echo off\nfs-indexer.exe %*\n')
-    if system != 'windows':
-        run_script.chmod(0o755)
+    # Copy executable and create run script
+    shutil.copy2(dist_dir / 'fs-indexer', platform_dir)
+    run_script = platform_dir / 'run-indexer.sh'
+    run_script.write_text('#!/bin/bash\n./fs-indexer "$@"\n')
+    run_script.chmod(0o755)
 
     print(f"\nBuild complete! Release package created at: {platform_dir}")
     print("\nTo run the indexer:")
