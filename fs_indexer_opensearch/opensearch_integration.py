@@ -20,10 +20,53 @@ class OpenSearchClient:
     def _ensure_index_exists(self):
         """Ensure the index exists with proper mapping."""
         mapping = {
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "refresh_interval": "30s",
+                "analysis": {
+                    "analyzer": {
+                        "path_analyzer": {
+                            "tokenizer": "path_hierarchy",
+                            "char_filter": ["path_special_chars"],
+                            "filter": ["lowercase", "word_delimiter_graph"]
+                        },
+                        "name_analyzer": {
+                            "tokenizer": "standard",
+                            "char_filter": ["name_special_chars"],
+                            "filter": ["lowercase", "word_delimiter_graph"]
+                        }
+                    },
+                    "char_filter": {
+                        "path_special_chars": {
+                            "type": "pattern_replace",
+                            "pattern": "[_.]",
+                            "replacement": " "
+                        },
+                        "name_special_chars": {
+                            "type": "pattern_replace",
+                            "pattern": "[_.]",
+                            "replacement": " "
+                        }
+                    }
+                }
+            },
             "mappings": {
                 "properties": {
-                    "filepath": {"type": "keyword"},
-                    "name": {"type": "text"},
+                    "filepath": {
+                        "type": "text",
+                        "analyzer": "path_analyzer",
+                        "fields": {
+                            "keyword": {"type": "keyword"}
+                        }
+                    },
+                    "name": {
+                        "type": "text",
+                        "analyzer": "name_analyzer",
+                        "fields": {
+                            "keyword": {"type": "keyword"}
+                        }
+                    },
                     "size_bytes": {"type": "long"},
                     "size": {"type": "keyword"},
                     "modified_time": {"type": "date"},

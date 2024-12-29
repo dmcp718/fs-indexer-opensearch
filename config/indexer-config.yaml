@@ -83,7 +83,7 @@ logging:
   # - "INFO": Shows progress updates, batch processing, and summary stats
   # - "WARNING": Shows when some files in a batch couldn't be processed
   # - "ERROR": Shows file access errors, API failures, and processing errors
-  level: "DEBUG"
+  level: "INFO"
   file: "logs/fs-indexer.log"
   max_size_mb: 10
   backup_count: 5
@@ -140,4 +140,4 @@ skip_patterns:
     - "Godzilla_2K"
     - "test_files"
     - "00_Media"
-    - "Adobe_MAX"
+    # - "Adobe_MAX"
