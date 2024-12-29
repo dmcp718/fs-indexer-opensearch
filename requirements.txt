@@ -1,0 +1,7 @@
+dbos>=0.0.1
+xxhash>=3.4.1
+PyYAML>=6.0.1
+SQLAlchemy>=2.0.23
+psycopg2-binary>=2.9.9
+alembic>=1.12.1
+redis==5.0.1

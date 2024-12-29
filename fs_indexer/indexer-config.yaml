@@ -1,0 +1,120 @@
+# Configuration for the file indexer
+
+# =============================================
+# Async Worker Setup Instructions
+# =============================================
+# To use async checksum calculation:
+# 1. Set checksum_mode: "async" in this config
+# 2. Start the Redis server and worker process:
+#    ./venv/bin/python3 -m fs_indexer.run_checksum_worker
+# 3. In another terminal, run the main indexer:
+#    ./venv/bin/python3 -m fs_indexer.main
+#
+# The worker will:
+# - Calculate checksums in the background
+# - Update the database automatically
+# - Handle Redis connection and recovery
+# - Process files in batches for efficiency
+#
+# Monitor the worker logs for progress and any errors
+# =============================================
+
+# Root path to start indexing from (optional, can be provided via --root-path argument)
+# root_path: ./data
+
+# Database configuration
+database:
+  connection:
+    url: "sqlite:///data/fs_index.db"
+    max_retries: 3
+    retry_interval: 5
+
+# Performance tuning
+performance:
+  # Database settings
+  batch_size: 50000  # Optimal batch size for single writer
+  db_pool_size: 1   # SQLite only supports 1 writer at a time
+  db_max_overflow: 0  # No overflow for SQLite
+  read_buffer_size: 134217728  # 128MB for better I/O
+  max_workers: 16  # Balanced for parallel scanning
+  
+  # Memory settings
+  mmap_size: 1073741824  # 1GB for memory-mapped I/O
+  
+  # File scanning
+  scan_chunk_size: 20000  # Process files in chunks during scan
+  parallel_scan: true    # Enable parallel directory scanning
+
+  # Query optimization
+  enable_parallel_scan: false  # SQLite doesn't support parallel scans
+  vacuum_threshold: 10000  # Run VACUUM after this many updates
+  stats_update_frequency: 5000  # Update table statistics after this many changes
+
+# Checksum calculation mode
+# - sync: Calculate checksums immediately (slower indexing)
+# - async: Queue checksums for background processing (faster indexing)
+# - disabled: Skip checksum calculation
+checksum_mode: disabled
+
+# Redis configuration for async operations
+redis:
+  host: localhost
+  port: 16379  # Using a non-standard port to avoid conflicts
+  db: 0
+  # Key prefix for checksum tasks
+  checksum_key_prefix: fs_indexer:checksum
+  # How long to keep completed checksum tasks (in seconds)
+  checksum_ttl: 86400  # 24 hours
+  # Worker configuration
+  worker:
+    batch_size: 100  # Number of files to process in each batch
+    retry_interval: 1  # Seconds to wait between retries
+    max_retries: 5  # Maximum number of connection retries
+
+# Check and remove database records for files that no longer exist
+check_missing_files: false
+
+# Logging configuration
+logging:
+  log_dir: ./logs
+  filename: "fs_indexer.log"
+  level: "INFO"  # Set to DEBUG for more detailed logs
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  rotation:
+    max_bytes: 10485760  # 10MB
+    backup_count: 5
+
+# Skip patterns for file extensions and specific files
+skip_patterns:
+  # Skip files with these extensions
+  extensions:
+    - ".DS_Store"
+    - ".git"
+    - ".gitignore"
+    - ".svn"
+    - ".hg"
+    - ".idea"
+    - "__pycache__"
+    - "*.pyc"
+    - "*.pyo"
+    - "*.pyd"
+    - "*.so"
+    - "*.dylib"
+    - "*.dll"
+    - "*.class"
+    - "*.o"
+    - "*.obj"
+  
+  # Skip files in these directories
+  directories:
+    - ".git"
+    - ".svn"
+    - ".hg"
+    - "__pycache__"
+    - "node_modules"
+    - "venv"
+    - "env"
+    - ".env"
+  
+  # Skip hidden files (starting with .)
+  skip_hidden: true
