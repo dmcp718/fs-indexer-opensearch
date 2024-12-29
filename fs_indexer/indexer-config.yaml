@@ -19,8 +19,10 @@
 # Monitor the worker logs for progress and any errors
 # =============================================
 
-lucidlink_filespace: true
-filespace_port: 9778
+# LucidLink Filespace configuration
+lucidlink_filespace:
+  enabled: true
+  port: 9778  # Port for the LucidLink Filespace API
 
 # =============================================
 
@@ -30,28 +32,32 @@ root_path: "/Volumes/dmpfs/production"
 # Database configuration
 database:
   connection:
-    url: "sqlite:///data/fs_index.db"
-    max_retries: 3
-    retry_interval: 5
+    url: "duckdb:///fs_index.duckdb"
+    options:
+      memory_limit: "85%"  # Increased memory limit for better performance
+      threads: 16  # Match max_workers for better parallelism
+      temp_directory: "./.tmp"  # Temporary directory for spilling
+      checkpoint_on_shutdown: true  # Ensure data is persisted properly
+      compression: "lz4"  # Fast compression algorithm
 
 # Performance tuning
 performance:
   # Database settings
-  batch_size: 50000  # Optimal batch size for single writer
-  db_pool_size: 1   # SQLite only supports 1 writer at a time
-  db_max_overflow: 0  # No overflow for SQLite
-  read_buffer_size: 134217728  # 128MB for better I/O
-  max_workers: 16  # Balanced for parallel scanning
+  batch_size: 100000  # Return to original batch size
+  db_pool_size: 1   # DuckDB only supports 1 writer at a time
+  db_max_overflow: 0  # No overflow needed
+  read_buffer_size: 268435456  # 256MB for better I/O performance
+  max_workers: 16  # Keep number of parallel workers
   
   # Memory settings
-  mmap_size: 1073741824  # 1GB for memory-mapped I/O
+  mmap_size: 2147483648  # 2GB for memory-mapped I/O
   
   # File scanning
   scan_chunk_size: 20000  # Process files in chunks during scan
   parallel_scan: true    # Enable parallel directory scanning
 
   # Query optimization
-  enable_parallel_scan: false  # SQLite doesn't support parallel scans
+  enable_parallel_scan: false  # DuckDB doesn't support parallel scans
   vacuum_threshold: 10000  # Run VACUUM after this many updates
   stats_update_frequency: 5000  # Update table statistics after this many changes
 
@@ -81,14 +87,11 @@ check_missing_files: false
 
 # Logging configuration
 logging:
-  log_dir: ./logs
-  filename: "fs_indexer.log"
-  level: DEBUG  # Set to DEBUG for more verbose output
-  format: '%(asctime)s - %(levelname)s - %(message)s'
-  file: 'indexer.log'
-  rotation:
-    max_bytes: 10485760  # 10MB
-    backup_count: 5
+  level: "INFO"  # Set to DEBUG, INFO, WARNING, ERROR, or CRITICAL
+  file: "fs_indexer.log"
+  max_size_mb: 10
+  backup_count: 5
+  console: true  # Also log to console
 
 # Skip patterns for file extensions and specific files
 skip_patterns:
@@ -123,9 +126,12 @@ skip_patterns:
     - "env"
     - ".env"
     # - "test_files"
-    # - "Godzilla_2K"
-    # - "Godzilla_10K_tif"
-
+    - "Godzilla_2K"
+    - "Godzilla_10K_tif"
+    - ".lucid_audit"
+    - "test_files/dir_1"
+    - "test_files/dir_2"
+    - "invalid_dir"  # Test non-existent directory
   
   # Skip hidden files (starting with .)
   skip_hidden: true

@@ -3,95 +3,44 @@
 import logging
 import logging.handlers
 import os
+import sys
 import time
+import argparse
+import yaml
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Generator
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-# import xxhash  # Temporarily commented out as not needed for LucidLink API
-import yaml
-import subprocess
-import atexit
-import signal
-import sys
-import redis
-import argparse
+from typing import Dict, List, Any, Optional, Generator
+from threading import Lock, Thread, Event
 from queue import Queue, Empty
-from threading import Thread, Event, Lock
-from sqlalchemy import create_engine, select, delete, func, text
-from sqlalchemy.orm import sessionmaker, Session
-from fs_indexer.schema import metadata, indexed_files, lucidlink_files
-from fs_indexer.db_optimizations import (
-    optimize_connection_pool,
-    configure_sqlite,
-    get_table_statistics,
-    bulk_upsert_files,
-    check_missing_files
-)
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+import redis
+import duckdb
+import asyncio
+from fs_indexer.db_duckdb import init_database, bulk_upsert_files, cleanup_missing_files, get_database_stats
 from fs_indexer.lucidlink_api import LucidLinkAPI
 
 # Initialize basic logging first
 logger = logging.getLogger(__name__)
 
 # Load configuration
-def load_config(config_path: str = None) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
-    # Get the base path for the application
-    if getattr(sys, 'frozen', False):
-        # Running as compiled executable
-        base_path = os.path.dirname(sys.executable)
-    else:
-        # Running as script
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    
-    if config_path is None:
-        config_path = os.path.join(base_path, 'indexer-config.yaml')
-    else:
-        config_path = os.path.abspath(config_path)
+def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """Load configuration from file."""
+    if not config_path:
+        config_path = os.path.join(os.path.dirname(__file__), 'indexer-config.yaml')
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+        
+    # Set default values
+    config.setdefault('database', {})
+    config['database'].setdefault('connection', {})
+    config['database']['connection'].setdefault('url', 'duckdb:///fs_index.duckdb')
+    config['database']['connection'].setdefault('options', {})
     
-    # Create logging directory if it doesn't exist
-    os.makedirs(config["logging"]["log_dir"], exist_ok=True)
-    
-    # Convert relative paths to absolute
-    if 'root_path' in config and not os.path.isabs(config['root_path']):
-        config['root_path'] = os.path.abspath(config['root_path'])
-    
-    if not os.path.isabs(config["database"]["connection"]["url"]):
-        if config["database"]["connection"]["url"].startswith("sqlite:///"):
-            # Handle SQLite URLs specially
-            db_path = config["database"]["connection"]["url"][10:]
-            if not os.path.isabs(db_path):
-                abs_db_path = os.path.abspath(db_path)
-                config["database"]["connection"]["url"] = f"sqlite:///{abs_db_path}"
-    
-    # Fix database URL
-    db_url = config['database']['connection']['url']
-    if db_url.startswith('sqlite:///'):
-        # Extract the path part
-        db_path = db_url[10:]
-        if not os.path.isabs(db_path):
-            # Make the path absolute relative to base_path
-            abs_db_path = os.path.abspath(os.path.join(base_path, db_path))
-            config['database']['connection']['url'] = f'sqlite:///{abs_db_path}'
-    
-    # Fix log directory
-    if not os.path.isabs(config['logging']['log_dir']):
-        config['logging']['log_dir'] = os.path.abspath(os.path.join(base_path, config['logging']['log_dir']))
-    
-    # Create necessary directories
-    os.makedirs(os.path.dirname(config['database']['connection']['url'][10:]), exist_ok=True)
-    
-    # Set defaults for optional fields
-    config.setdefault("batch_size", 10000)
-    config.setdefault("max_workers", 8)
-    config.setdefault("read_buffer_size", 131072)
-    config.setdefault("skip_hidden", True)
-    config.setdefault("enable_checksum", False)  # Default to not calculate checksums
-    config.setdefault("checksum_mode", "sync")  # Default to sync checksum calculation
-    config.setdefault("scan_chunk_size", 1000)  # Default scan chunk size
+    # Create data directory if needed
+    db_path = config['database']['connection']['url'].replace('duckdb:///', '')
+    if db_path and os.path.dirname(db_path):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
     
     return config
 
@@ -106,19 +55,20 @@ def configure_logging(config: Dict[str, Any]) -> None:
     logger.handlers.clear()
     
     # Add file handler
-    log_file = os.path.join(config["logging"]["log_dir"], config["logging"]["filename"])
+    log_file = config["logging"]["file"]
     file_handler = logging.handlers.RotatingFileHandler(
         log_file,
-        maxBytes=config["logging"]["rotation"]["max_bytes"],
-        backupCount=config["logging"]["rotation"]["backup_count"],
+        maxBytes=config["logging"]["max_size_mb"] * 1024 * 1024,  # Convert MB to bytes
+        backupCount=config["logging"]["backup_count"],
     )
-    file_handler.setFormatter(logging.Formatter(config["logging"]["format"]))
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(file_handler)
     
-    # Add console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(config["logging"]["format"]))
-    logger.addHandler(console_handler)
+    # Add console handler if enabled
+    if config["logging"].get("console", True):
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(console_handler)
 
 # Constants
 def get_constants(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -281,7 +231,7 @@ def scan_directory_parallel(root_path: Path, config: Dict[str, Any], max_workers
             scan_rate = scanned_files / scan_duration if scan_duration > 0 else 0
             logger.info(f"Scanned {scanned_files} files so far ({scan_rate:.1f} files/s)")
 
-def process_files_worker(queue: Queue, stop_event: Event, session: Session, stats: WorkflowStats, config: Dict[str, Any]):
+def process_files_worker(queue: Queue, stop_event: Event, session: duckdb.DuckDBPyConnection, stats: WorkflowStats, config: Dict[str, Any]):
     """Worker thread to process files from queue."""
     files_chunk = []
     chunk_size = config["batch_size"]
@@ -298,9 +248,6 @@ def process_files_worker(queue: Queue, stop_event: Event, session: Session, stat
                 try:
                     # Bulk upsert the chunk
                     processed = bulk_upsert_files(session, files_chunk)
-                    session.commit()
-                    
-                    # Update stats
                     stats.files_updated += processed
                     chunk_duration = time.time() - chunk_start_time
                     chunk_rate = processed / chunk_duration if chunk_duration > 0 else 0
@@ -332,7 +279,6 @@ def process_files_worker(queue: Queue, stop_event: Event, session: Session, stat
     if files_chunk:
         try:
             processed = bulk_upsert_files(session, files_chunk)
-            session.commit()
             stats.files_updated += processed
             chunk_duration = time.time() - chunk_start_time
             chunk_rate = processed / chunk_duration if chunk_duration > 0 else 0
@@ -341,7 +287,7 @@ def process_files_worker(queue: Queue, stop_event: Event, session: Session, stat
         except Exception as e:
             logger.error(f"Error processing final chunk: {e}")
 
-def batch_update_database(session: Session, files_batch: List[Dict[str, Any]]) -> None:
+def batch_update_database(session: duckdb.DuckDBPyConnection, files_batch: List[Dict[str, Any]]) -> None:
     """Update database with a batch of files."""
     try:
         processed = bulk_upsert_files(session, files_batch)
@@ -353,45 +299,32 @@ def batch_update_database(session: Session, files_batch: List[Dict[str, Any]]) -
         logger.error(error_msg)
         raise
 
-def process_files(session: Session, files: List[Dict], stats: WorkflowStats, config: Dict[str, Any]) -> None:
+def process_files(session: duckdb.DuckDBPyConnection, files: List[Dict], stats: WorkflowStats, config: Dict[str, Any]) -> None:
     """Process a list of files and update the database."""
     try:
         total_files = len(files)
         stats.total_files = total_files
         
         # Process files in batches
-        engine = session.get_bind()  # Get the engine from session
-        session = Session(bind=engine)  # Create new session bound to engine
-        try:
-            total_processed = 0
-            start_time = time.time()
-            last_progress_time = start_time
-            last_progress_count = 0
+        total_processed = 0
+        start_time = time.time()
+        last_progress_time = start_time
+        last_progress_count = 0
+        
+        for i in range(0, len(files), config["batch_size"]):
+            batch = files[i:i + config["batch_size"]]
+            processed = bulk_upsert_files(session, batch)
+            total_processed += processed
+            stats.files_updated += processed
             
-            for i in range(0, len(files), config["batch_size"]):
-                batch = files[i:i + config["batch_size"]]
-                processed = bulk_upsert_files(session, batch)
-                total_processed += processed
-                stats.files_updated += processed
-                
-                # Calculate and log processing rate
-                current_time = time.time()
-                elapsed = current_time - last_progress_time
-                files_in_chunk = total_processed - last_progress_count
-                rate = files_in_chunk / elapsed if elapsed > 0 else 0
-                logger.info(f"Processed {total_processed}/{total_files} files ({rate:.1f} files/s in last chunk)")
-                last_progress_time = current_time
-                last_progress_count = total_processed
-            
-            # Final commit after all batches
-            session.commit()
-            
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Error processing files: {e}")
-            raise
-        finally:
-            session.close()
+            # Calculate and log processing rate
+            current_time = time.time()
+            elapsed = current_time - last_progress_time
+            files_in_chunk = total_processed - last_progress_count
+            rate = files_in_chunk / elapsed if elapsed > 0 else 0
+            logger.info(f"Processed {total_processed}/{total_files} files ({rate:.1f} files/s in last chunk)")
+            last_progress_time = current_time
+            last_progress_count = total_processed
             
     except Exception as e:
         error_msg = f"Critical error in process_files: {str(e)}"
@@ -399,91 +332,82 @@ def process_files(session: Session, files: List[Dict], stats: WorkflowStats, con
         stats.add_error(error_msg)
         raise
 
-def process_lucidlink_files(session: Session, stats: WorkflowStats, config: Dict[str, Any]) -> None:
+def process_lucidlink_files(conn: duckdb.DuckDBPyConnection, stats: WorkflowStats, config: Dict[str, Any]) -> None:
     """Process files using LucidLink API"""
     try:
         print("Indexing started...")
+        logger.info("Initializing LucidLink API...")
         
-        api = LucidLinkAPI(config['filespace_port'])
+        # Initialize API with parallel workers
+        max_workers = config.get('performance', {}).get('max_workers', 10)  # Default to 10 workers if not specified
+        port = config.get('lucidlink_filespace', {}).get('port', 8080)  # Default to 8080 if not specified
+        logger.info(f"Connecting to LucidLink API on port {port}")
         
-        # Get skip directories from config
-        skip_directories = config.get('skip_patterns', {}).get('directories', [])
-        
-        # Create a batch for bulk database updates
-        batch = []
-        files_in_batch = 0  # Track actual files in batch
-        batch_size = config['batch_size']
-        now = datetime.now(timezone.utc)
-        
-        # Keep track of all processed items for cleanup
-        processed_items = set()
-        
-        for file_info in api.traverse_filesystem(skip_directories=skip_directories):
-            try:
-                # Add to processed set
-                processed_items.add(file_info['name'])
+        async def process_files_async():
+            async with LucidLinkAPI(port, max_workers=max_workers) as api:
+                logger.info("Starting filesystem traversal...")
+                # Get skip directories from config
+                skip_directories = config.get('skip_patterns', {}).get('directories', [])
                 
-                # Convert API response to database format
-                db_entry = {
-                    'id': file_info['id'],
-                    'name': file_info['name'],  # This is the full path name (primary key)
-                    'type': file_info['type'].lower(),  # Normalize type to lowercase
-                    'size': file_info['size'],
-                    'creation_time': file_info['creation_time'],
-                    'update_time': file_info['update_time'],
-                    'indexed_at': now,
-                    'error_count': 0,
-                    'last_error': None
-                }
+                # Create a batch for bulk database updates
+                batch = []
+                files_in_batch = 0  # Track actual files in batch
+                batch_size = config['performance']['batch_size']
+                now = datetime.now(timezone.utc)
                 
-                batch.append(db_entry)
-                
-                # Track stats based on normalized type
-                if db_entry['type'] == 'file':
-                    stats.total_files += 1
-                    stats.total_size += db_entry['size']
-                    files_in_batch += 1
-                elif db_entry['type'] == 'directory':
-                    stats.total_dirs += 1
-                else:
-                    logger.warning(f"Unknown type '{db_entry['type']}' for {db_entry['name']}")
-                
-                # Process batch if it reaches the configured size
-                if len(batch) >= batch_size:
-                    bulk_upsert_files(session, batch, table='lucidlink_files')
+                async for file_info in api.traverse_filesystem(skip_directories=skip_directories):
+                    try:
+                        logger.debug(f"Processing file: {file_info.get('name', 'unknown')}")
+                        
+                        # Convert API response to database format
+                        db_entry = {
+                            'id': file_info['id'],
+                            'name': file_info['name'],  # This is the full path name (primary key)
+                            'type': file_info['type'].lower(),  # Normalize type to lowercase
+                            'size': file_info['size'],
+                            'creation_time': file_info['creation_time'],
+                            'update_time': file_info['update_time'],
+                            'indexed_at': now,
+                            'error_count': 0,
+                            'last_error': None
+                        }
+                        
+                        batch.append(db_entry)
+                        
+                        # Track stats based on normalized type
+                        if db_entry['type'] == 'file':
+                            stats.total_files += 1
+                            stats.total_size += db_entry['size']
+                            files_in_batch += 1
+                        elif db_entry['type'] == 'directory':
+                            stats.total_dirs += 1
+                        
+                        # Process batch if it reaches the configured size
+                        if len(batch) >= batch_size:
+                            logger.info(f"Processing batch of {len(batch)} items...")
+                            bulk_upsert_files(conn, batch)
+                            stats.files_updated += files_in_batch  # Only count actual files
+                            batch = []
+                            files_in_batch = 0
+                            
+                    except Exception as e:
+                        error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
+                        logger.error(error_msg)
+                        stats.add_error(error_msg)
+                        continue
+                        
+                # Process any remaining files in the final batch
+                if batch:
+                    logger.info(f"Processing final batch of {len(batch)} items...")
+                    bulk_upsert_files(conn, batch)
                     stats.files_updated += files_in_batch  # Only count actual files
-                    batch = []
-                    files_in_batch = 0
                     
-            except Exception as e:
-                error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
-                logger.error(error_msg)
-                stats.add_error(error_msg)
-                continue
+                # Clean up items that no longer exist
+                logger.info("Cleaning up removed files...")
+                cleanup_missing_files(conn, api._all_files)  # Pass the full file info
                 
-        # Process any remaining files in the final batch
-        if batch:
-            bulk_upsert_files(session, batch, table='lucidlink_files')
-            stats.files_updated += files_in_batch  # Only count actual files
-            
-        # Clean up items that no longer exist
-        if processed_items:
-            # Convert set to list and chunk into groups of 999 (SQLite limit)
-            items_list = list(processed_items)
-            chunk_size = 999
-            
-            for i in range(0, len(items_list), chunk_size):
-                chunk = items_list[i:i + chunk_size]
-                placeholders = ','.join(':param' + str(i) for i in range(len(chunk)))
-                params = {f'param{i}': chunk[i] for i in range(len(chunk))}
-                cleanup_query = text(f"""
-                    DELETE FROM lucidlink_files 
-                    WHERE name NOT IN ({placeholders})
-                """)
-                session.execute(cleanup_query, params)
-                
-            session.commit()
-            
+        # Run the async function
+        asyncio.run(process_files_async())
         print("Indexing complete!")
             
     except Exception as e:
@@ -575,9 +499,9 @@ def log_workflow_summary(stats: WorkflowStats) -> None:
     
     logger.info("=" * 80)
 
-def get_database_stats(session: Session) -> Dict[str, Any]:
+def get_database_stats(session: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
     """Get database statistics."""
-    return get_table_statistics(session)
+    return get_database_stats(session)
 
 def main():
     """Main entry point."""
@@ -595,42 +519,28 @@ def main():
         config['root_path'] = args.root_path
         
     # Initialize database
-    engine = create_engine(
-        config['database']['connection']['url'],
-        **config['database']['connection'].get('options', {})
-    )
-    
-    if 'sqlite' in config['database']['connection']['url']:
-        configure_sqlite(engine)
-        
-    metadata.create_all(engine)
-    optimize_connection_pool(engine, config)
-    Session = sessionmaker(bind=engine)
+    db_path = os.path.join(os.path.dirname(__file__), 'fs_index.duckdb')
+    conn = init_database(db_path)
     
     try:
-        with Session() as session:
-            stats = WorkflowStats()
-            
-            if config.get('lucidlink_filespace', False):
-                # Use LucidLink API for file processing
-                process_lucidlink_files(session, stats, config)
-            else:
-                # Use traditional file system traversal
-                files_generator = scan_directory_parallel(
-                    Path(config['root_path']),
-                    config,
-                    config.get('max_workers', 8)
-                )
-                process_files(session, files_generator, stats, config)
-                
-            session.commit()
-            stats.finish()
-            print()  # Add newline before summary
-            log_workflow_summary(stats)
-            
-    except Exception as e:
-        logger.error(f"Indexing failed: {str(e)}")
+        # Initialize stats
+        stats = WorkflowStats()
+        
+        # Process files
+        process_lucidlink_files(conn, stats, config)
+        
+        # Log summary
+        stats.finish()
+        log_workflow_summary(stats)
+        
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
         sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error in main workflow: {str(e)}")
+        sys.exit(1)
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
