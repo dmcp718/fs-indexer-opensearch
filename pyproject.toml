@@ -8,17 +8,14 @@ version = "0.1.0"
 authors = [
   { name="David Phillips" },
 ]
-description = "High-performance file system indexer with SQLite backend"
+description = "High-performance file system indexer with DuckDB backend and async I/O"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "dbos",
-    "sqlalchemy",
-    "alembic",
-    "xxhash",
-    "pyyaml",
-    "psycopg2-binary",
-    "redis==5.0.1",
+    "aiohttp>=3.9.1",
+    "duckdb>=0.9.2",
+    "xxhash>=3.4.1",
+    "pyyaml>=6.0.1",
 ]
 
 [project.optional-dependencies]
