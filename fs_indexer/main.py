@@ -13,7 +13,6 @@ from typing import Dict, List, Any, Optional, Generator
 from threading import Lock, Thread, Event
 from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-import redis
 import duckdb
 import asyncio
 from fs_indexer.db_duckdb import init_database, bulk_upsert_files, cleanup_missing_files, get_database_stats
@@ -415,56 +414,6 @@ def process_lucidlink_files(conn: duckdb.DuckDBPyConnection, stats: WorkflowStat
         logger.error(error_msg)
         stats.add_error(error_msg)
         raise
-
-def start_redis_server():
-    """Start the local Redis server."""
-    try:
-        # Check if Redis is already running
-        redis_client = redis.Redis(
-            host=CONFIG['redis']['host'],
-            port=CONFIG['redis']['port'],
-            db=CONFIG['redis']['db']
-        )
-        redis_client.ping()
-        logger.info("Redis server is already running")
-        return None
-    except redis.ConnectionError:
-        # Start Redis server if not running
-        redis_process = subprocess.Popen(
-            ['redis-server', '--port', str(CONFIG['redis']['port'])],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        
-        # Wait for Redis to start
-        max_retries = 5
-        retry_interval = 1
-        for i in range(max_retries):
-            try:
-                redis_client = redis.Redis(
-                    host=CONFIG['redis']['host'],
-                    port=CONFIG['redis']['port'],
-                    db=CONFIG['redis']['db']
-                )
-                redis_client.ping()
-                logger.info("Redis server started successfully")
-                return redis_process
-            except redis.ConnectionError:
-                if i < max_retries - 1:
-                    time.sleep(retry_interval)
-                else:
-                    raise Exception("Failed to start Redis server")
-
-def stop_redis_server(redis_process):
-    """Stop the Redis server gracefully."""
-    if redis_process:
-        logger.info("Stopping Redis server...")
-        redis_process.terminate()
-        try:
-            redis_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            redis_process.kill()
-        logger.info("Redis server stopped")
 
 def log_workflow_summary(stats: WorkflowStats) -> None:
     """Log a summary of the workflow execution."""
