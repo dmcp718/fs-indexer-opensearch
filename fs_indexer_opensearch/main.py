@@ -482,12 +482,12 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
             # Map database fields to OpenSearch fields
             doc = {
                 "filepath": row[1],  # name field
-                "filename": os.path.basename(row[1]),
+                "name": os.path.basename(row[1]),  # Use name instead of filename
                 "size_bytes": row[3],
                 "size": format_size(row[3]),  # Human readable size
-                "creation_time": row[4].isoformat(),  # Add creation time
+                "creation_time": row[4].isoformat(),
                 "modified_time": row[5].isoformat(),
-                "file_type": row[2],
+                "type": row[2],  # Use type instead of file_type
                 "indexed_time": datetime.now(timezone.utc).isoformat()
             }
             

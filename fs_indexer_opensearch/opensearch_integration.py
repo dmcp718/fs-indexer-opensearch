@@ -23,12 +23,12 @@ class OpenSearchClient:
             "mappings": {
                 "properties": {
                     "filepath": {"type": "keyword"},
-                    "filename": {"type": "text"},
+                    "name": {"type": "text"},
                     "size_bytes": {"type": "long"},
                     "size": {"type": "keyword"},
                     "modified_time": {"type": "date"},
                     "creation_time": {"type": "date"},
-                    "file_type": {"type": "keyword"},
+                    "type": {"type": "keyword"},
                     "indexed_time": {"type": "date"}
                 }
             }
