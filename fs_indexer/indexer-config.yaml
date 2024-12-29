@@ -114,24 +114,9 @@ skip_patterns:
     - "*.o"
     - "*.obj"
   
-  # Skip files in these directories
   directories:
-    - ".git"
-    - ".svn"
-    - ".hg"
-    - "__pycache__"
-    - "node_modules"
-    - "venv"
-    - ".venv"
-    - "env"
-    - ".env"
-    # - "test_files"
-    - "Godzilla_2K"
-    - "Godzilla_10K_tif"
-    - ".lucid_audit"
-    - "test_files/dir_1"
-    - "test_files/dir_2"
-    - "invalid_dir"  # Test non-existent directory
-  
-  # Skip hidden files (starting with .)
-  skip_hidden: true
+    - .git
+    - .venv
+    - env
+    - .env
+    - .lucid_audit
