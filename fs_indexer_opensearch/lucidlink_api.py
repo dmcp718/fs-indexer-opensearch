@@ -215,6 +215,20 @@ class LucidLinkAPI:
             logger.error(f"Error traversing filesystem: {str(e)}")
             raise
             
+    async def health_check(self) -> bool:
+        """Check if the LucidLink API is available"""
+        try:
+            # Use shorter timeout for health check
+            url = self.base_url
+            timeout = aiohttp.ClientTimeout(total=1)  # 1 second timeout
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    await response.json()
+                    return True
+        except Exception as e:
+            logger.error(f"LucidLink API health check failed: {str(e)}")
+            return False
+            
     def get_all_files(self) -> List[Dict[str, Any]]:
         """Get all files and directories that were traversed"""
         return self._all_files

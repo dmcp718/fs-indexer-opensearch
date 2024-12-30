@@ -376,6 +376,10 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
         
         async def process_files_async():
             async with LucidLinkAPI(port=port, max_workers=max_workers) as api:
+                # Check API health first
+                if not await api.health_check():
+                    raise RuntimeError("LucidLink API is not available")
+                
                 logger.info("Starting filesystem traversal...")
                 
                 # Get full and relative root paths
@@ -636,41 +640,44 @@ def get_database_stats(session: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', help='Path to configuration file')
-    parser.add_argument('--root-path', help='Root path to start indexing from')
-    args = parser.parse_args()
-
-    # Load configuration
-    config = load_config(args.config)
-
-    # Override root path if provided
-    if args.root_path:
-        config['root_path'] = args.root_path
-
-    # Configure logging
-    configure_logging(config)
-
-    # Initialize database
-    session = init_database(config['database']['connection']['url'])
-
-    # Initialize stats
-    stats = WorkflowStats()
-
     try:
-        print("Indexing started...")
-        process_lucidlink_files(session, stats, config)
-        print("Indexing complete!")
-        
-    except Exception as e:
-        logger.error(f"Error in main workflow: {e}")
-        raise
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--config', help='Path to configuration file')
+        parser.add_argument('--root-path', help='Root path to start indexing from')
+        args = parser.parse_args()
 
-    finally:
-        session.close()
-        
-        # Log workflow summary
-        log_workflow_summary(stats)
+        # Load configuration
+        config = load_config(args.config)
+
+        # Override root path if provided
+        if args.root_path:
+            config['root_path'] = args.root_path
+
+        # Configure logging
+        configure_logging(config)
+
+        # Initialize database
+        session = init_database(config['database']['connection']['url'])
+
+        # Initialize stats
+        stats = WorkflowStats()
+
+        try:
+            print("Indexing started...")
+            process_lucidlink_files(session, stats, config)
+        except RuntimeError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Error in main workflow: {str(e)}")
+            sys.exit(1)
+        finally:
+            session.close()
+            log_workflow_summary(stats)
+
+    except Exception as e:
+        logger.error(f"Unhandled error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
