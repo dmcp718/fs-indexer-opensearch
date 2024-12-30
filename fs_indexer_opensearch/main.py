@@ -398,31 +398,23 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                 direct_link_tasks = []
                 logger.info(f"Processing batch of {len(batch)} items for direct links")
                 for item in batch:
-                    if item['type'] != 'directory':  # Only generate links for files
-                        logger.debug(f"Generating direct link for: {item['relative_path']}")
-                        task = lucidlink_api.get_direct_link(item['relative_path'])
-                        direct_link_tasks.append(task)
-                    else:
-                        direct_link_tasks.append(None)
+                    logger.debug(f"Generating direct link for: {item['relative_path']}")
+                    task = lucidlink_api.get_direct_link(item['relative_path'])
+                    direct_link_tasks.append(task)
                         
                 # Wait for all direct link generations
                 if direct_link_tasks:
-                    logger.info(f"Waiting for {len([t for t in direct_link_tasks if t is not None])} direct link tasks")
-                    direct_links = await asyncio.gather(*[t for t in direct_link_tasks if t is not None], return_exceptions=True)
+                    logger.info(f"Waiting for {len(direct_link_tasks)} direct link tasks")
+                    direct_links = await asyncio.gather(*direct_link_tasks, return_exceptions=True)
                     
                     # Add direct links to batch items
-                    link_idx = 0
-                    for i, item in enumerate(batch):
-                        if item['type'] != 'directory':
-                            if isinstance(direct_links[link_idx], Exception):
-                                logger.error(f"Failed to generate direct link for {item['relative_path']}: {direct_links[link_idx]}")
-                                item['direct_link'] = None
-                            else:
-                                logger.debug(f"Got direct link for {item['relative_path']}: {direct_links[link_idx]}")
-                                item['direct_link'] = direct_links[link_idx]
-                            link_idx += 1
-                        else:
+                    for i, (item, direct_link) in enumerate(zip(batch, direct_links)):
+                        if isinstance(direct_link, Exception):
+                            logger.error(f"Failed to generate direct link for {item['relative_path']}: {direct_link}")
                             item['direct_link'] = None
+                        else:
+                            logger.debug(f"Got direct link for {item['relative_path']}: {direct_link}")
+                            item['direct_link'] = direct_link
                 
                 processed = bulk_upsert_files(session, batch)
                 with stats.lock:
