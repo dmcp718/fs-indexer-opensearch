@@ -187,70 +187,32 @@ class LucidLinkAPI:
         else:
             return 25   # Less parallelism for deep directories
             
-    async def traverse_filesystem(self, skip_directories=None) -> Generator[Dict[str, Any], None, None]:
-        """Traverse the entire filesystem using dynamic batched parallel requests"""
+    async def traverse_filesystem(self, root_path: str = None, skip_directories: List[str] = None) -> Generator[Dict[str, Any], None, None]:
+        """Traverse the filesystem and yield file/directory info"""
+        skip_directories = skip_directories or []
+        
         try:
-            # Initialize rate limiting
-            semaphore = asyncio.Semaphore(self.max_workers * 2)
-            
-            # Get top-level directories
-            top_level = await self.get_top_level_directories()
-            directories_to_traverse = []
-            current_depth = 0
-            
-            # Track all files for cleanup
-            self._all_files = []
-            
-            # Process top-level entries
-            for entry in top_level:
-                if skip_directories and entry['type'] == 'directory':
-                    dir_name = entry['name'].lstrip('/')
-                    if dir_name in skip_directories:
-                        continue
-                self._all_files.append(entry)
-                yield entry
-                if entry['type'] == 'directory' and (not skip_directories or entry['name'].lstrip('/') not in skip_directories):
-                    directories_to_traverse.append((entry['name'], 1))  # (path, depth)
-            
-            # Process directories in dynamic batches
-            while directories_to_traverse:
-                # Group directories by depth for optimal batch sizing
-                depth_groups = {}
-                for dir_path, depth in directories_to_traverse[:100]:  # Look ahead up to 100 dirs
-                    depth_groups.setdefault(depth, []).append(dir_path)
+            # Get initial directory listing from root_path
+            data = await self._make_request(root_path if root_path else "")
+            if not data:
+                logger.error("No entries found in response")
+                return
                 
-                if not depth_groups:
-                    break
-                    
-                # Process each depth group with appropriate batch size
-                new_directories = []
-                for depth, dirs in depth_groups.items():
-                    batch_size = self._calculate_batch_size(depth)
-                    current_batch = dirs[:batch_size]
-                    
-                    # Get contents of all directories in current batch
-                    batch_results = await self._batch_get_directories(current_batch, semaphore)
-                    
-                    # Process results and collect new directories
-                    for directory, contents in batch_results.items():
-                        for item in contents:
-                            if skip_directories and item['type'] == 'directory':
-                                dir_name = item['name'].lstrip('/')
-                                if dir_name in skip_directories:
-                                    continue
-                            self._all_files.append(item)
+            # Process each entry
+            for entry in data:
+                if entry['type'] == 'directory':
+                    if entry['name'] not in skip_directories:
+                        # Process directory
+                        yield entry
+                        # Recursively process contents using relative path
+                        next_path = f"{root_path}/{entry['name']}" if root_path else entry['name']
+                        async for item in self.traverse_filesystem(next_path, skip_directories):
                             yield item
-                            if item['type'] == 'directory' and (not skip_directories or item['name'].lstrip('/') not in skip_directories):
-                                new_directories.append((item['name'], depth + 1))
+                else:
+                    yield entry
                     
-                    # Remove processed directories
-                    directories_to_traverse = [(d, dep) for d, dep in directories_to_traverse if d not in current_batch]
-                
-                # Add new directories to process
-                directories_to_traverse.extend(new_directories)
-                
         except Exception as e:
-            logger.error(f"Filesystem traversal failed: {str(e)}")
+            logger.error(f"Error traversing filesystem: {str(e)}")
             raise
             
     def get_all_files(self) -> List[Dict[str, Any]]:

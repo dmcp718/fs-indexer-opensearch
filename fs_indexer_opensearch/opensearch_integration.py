@@ -1,5 +1,6 @@
-from opensearchpy import OpenSearch
+from opensearchpy import OpenSearch, helpers
 import logging
+from typing import List
 
 class OpenSearchClient:
     def __init__(self, host: str, port: int, username: str, password: str, index_name: str = "filesystem"):
@@ -103,4 +104,93 @@ class OpenSearchClient:
                 logging.info(f"Successfully indexed {len(data)//2} documents")
         except Exception as e:
             logging.error(f"Failed to send data to OpenSearch: {e}")
+            raise
+
+    def delete_by_ids(self, ids: List[str]) -> None:
+        """Delete documents from OpenSearch by their IDs."""
+        if not ids:
+            return
+            
+        # Prepare bulk delete actions
+        actions = []
+        for doc_id in ids:
+            actions.extend([
+                {"delete": {"_index": self.index_name, "_id": doc_id}}
+            ])
+            
+        if actions:
+            try:
+                # Send bulk delete request
+                response = self.client.bulk(body=actions, refresh=True)
+                
+                # Check for errors
+                if response.get('errors', False):
+                    errors = [item['delete']['error'] for item in response['items'] if 'error' in item['delete']]
+                    logging.error(f"Errors during bulk delete: {errors}")
+                else:
+                    logging.info(f"Successfully deleted {len(ids)} documents from OpenSearch")
+                    
+            except Exception as e:
+                logging.error(f"Failed to delete documents from OpenSearch: {str(e)}")
+                raise
+
+    def bulk_delete(self, ids: List[str]) -> None:
+        """Delete multiple documents by their IDs."""
+        if not ids:
+            return
+            
+        try:
+            # Prepare bulk delete actions
+            actions = [
+                {
+                    "_op_type": "delete",
+                    "_index": self.index_name,
+                    "_id": doc_id
+                }
+                for doc_id in ids
+            ]
+            
+            # Execute bulk operation using helpers.bulk instead of streaming_bulk
+            success, errors = helpers.bulk(
+                client=self.client,
+                actions=actions,
+                chunk_size=500,
+                raise_on_error=False,
+                stats_only=True
+            )
+            
+            if errors:
+                logging.warning(f"Bulk delete completed with errors - Success: {success}, Failed: {errors}")
+            else:
+                logging.info(f"Bulk delete completed successfully - Deleted: {success} documents")
+            
+        except Exception as e:
+            logging.error(f"Bulk delete failed: {str(e)}")
+            raise
+
+    def delete_by_path_prefix(self, path_prefix: str) -> None:
+        """Delete all documents with filepath starting with the given prefix."""
+        try:
+            # Build the query
+            query = {
+                "query": {
+                    "prefix": {
+                        "filepath": path_prefix
+                    }
+                }
+            }
+            
+            # Delete by query
+            response = self.client.delete_by_query(
+                index=self.index_name,
+                body=query,
+                conflicts="proceed",  # Continue even if there are version conflicts
+                refresh=True  # Refresh the index immediately
+            )
+            
+            deleted = response.get('deleted', 0)
+            logging.info(f"Deleted {deleted} documents with path prefix '{path_prefix}'")
+            
+        except Exception as e:
+            logging.error(f"Failed to delete documents by path prefix: {str(e)}")
             raise

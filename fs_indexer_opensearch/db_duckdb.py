@@ -4,8 +4,10 @@ import logging
 import duckdb
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 import pandas as pd
+from dateutil import tz
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -16,16 +18,12 @@ def init_database(db_url: str) -> duckdb.DuckDBPyConnection:
     
     conn = duckdb.connect(db_path)
     
-    # Check if table exists before dropping
-    table_exists = conn.execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'lucidlink_files'").fetchone()[0] > 0
-    if table_exists:
-        conn.execute("DROP TABLE lucidlink_files")
-    
     # Create files table if not exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS lucidlink_files (
             id VARCHAR PRIMARY KEY,
             name VARCHAR,
+            relative_path VARCHAR,
             type VARCHAR,
             size BIGINT,
             creation_time TIMESTAMP,
@@ -49,6 +47,7 @@ def bulk_upsert_files(conn: duckdb.DuckDBPyConnection, files_batch: List[Dict[st
             CREATE TEMPORARY TABLE IF NOT EXISTS temp_batch (
                 id VARCHAR PRIMARY KEY,
                 name VARCHAR,
+                relative_path VARCHAR,
                 type VARCHAR,
                 size BIGINT,
                 creation_time TIMESTAMP,
@@ -59,54 +58,72 @@ def bulk_upsert_files(conn: duckdb.DuckDBPyConnection, files_batch: List[Dict[st
             );
         """)
         
-        # Clear any existing data in temp table
-        conn.execute("DELETE FROM temp_batch;")
+        # Convert timestamps and prepare data
+        now = datetime.now(pytz.utc)
+        df = pd.DataFrame([{
+            'id': f['id'],
+            'name': f['name'],  # Use name from API
+            'relative_path': f['name'],  # Use name from API as relative path
+            'type': f['type'],
+            'size': f.get('size', 0),
+            'creation_time': datetime.fromtimestamp(f['creationTime'] / 1e9, tz=pytz.utc),
+            'update_time': datetime.fromtimestamp(f['updateTime'] / 1e9, tz=pytz.utc),
+            'indexed_at': now,
+            'error_count': 0,
+            'last_error': None
+        } for f in files_batch])
         
-        # Insert batch data directly using DuckDB's DataFrame interface
-        df = pd.DataFrame(files_batch)
-        conn.execute("INSERT INTO temp_batch SELECT * FROM df")
+        # Register DataFrame and perform upsert
+        conn.register("batch_df", df)
         
-        # Perform upsert using REPLACE strategy with conflict target
         conn.execute("""
-            INSERT INTO lucidlink_files 
-            SELECT * FROM temp_batch 
-            ON CONFLICT (id) DO UPDATE SET
-                name = EXCLUDED.name,
-                type = EXCLUDED.type,
-                size = EXCLUDED.size,
-                creation_time = EXCLUDED.creation_time,
-                update_time = EXCLUDED.update_time,
-                indexed_at = EXCLUDED.indexed_at,
-                error_count = EXCLUDED.error_count,
-                last_error = EXCLUDED.last_error;
+            INSERT OR REPLACE INTO lucidlink_files 
+            SELECT * FROM batch_df
         """)
         
-        # Get number of affected rows
-        result = conn.execute("SELECT COUNT(*) FROM temp_batch").fetchone()[0]
+        # Drop temporary table
+        conn.execute("DROP TABLE IF EXISTS temp_batch")
         
-        # Clean up temporary table
-        conn.execute("DROP TABLE temp_batch")
-        
-        return result
+        return len(files_batch)
         
     except Exception as e:
         logger.error(f"Bulk upsert failed: {str(e)}")
         raise
 
-def cleanup_missing_files(session: duckdb.DuckDBPyConnection, current_files: List[Dict[str, str]]) -> None:
-    """Remove files from the database that no longer exist in the filesystem."""
+def cleanup_missing_files(session: duckdb.DuckDBPyConnection, current_files: List[Dict[str, str]]) -> List[Tuple[str, str]]:
+    """Remove files from the database that no longer exist in the filesystem.
+    Returns a list of tuples (id, path) that were removed."""
     try:
         # Convert current files to DataFrame
         df = pd.DataFrame([{'id': f['id']} for f in current_files])
         
         if df.empty:
             logger.warning("No current files provided for cleanup")
-            return
+            return []
             
+        # Log current state
+        total_files = session.execute("SELECT COUNT(*) FROM lucidlink_files").fetchone()[0]
+        logger.info(f"Total files in database before cleanup: {total_files}")
+        logger.info(f"Current files provided for cleanup: {len(current_files)}")
+        
         # Create temporary table with current file IDs
-        session.execute("CREATE TEMP TABLE IF NOT EXISTS current_files (id STRING)")
+        session.execute("DROP TABLE IF EXISTS current_files")
+        session.execute("CREATE TEMP TABLE current_files (id STRING)")
         session.register("current_files_df", df)
         session.execute("INSERT INTO current_files SELECT id FROM current_files_df")
+        
+        # Get list of files to be removed with their paths
+        removed_files = session.execute("""
+            SELECT id, name, type FROM lucidlink_files
+            WHERE id NOT IN (SELECT id FROM current_files)
+        """).fetchall()
+        
+        if removed_files:
+            logger.info(f"Found {len(removed_files)} files to remove:")
+            for row in removed_files[:5]:  # Show first 5 for debugging
+                logger.info(f"  - {row[1]} (type: {row[2]})")
+            if len(removed_files) > 5:
+                logger.info(f"  ... and {len(removed_files) - 5} more")
         
         # Delete files that don't exist in current_files
         session.execute("""
@@ -114,8 +131,15 @@ def cleanup_missing_files(session: duckdb.DuckDBPyConnection, current_files: Lis
             WHERE id NOT IN (SELECT id FROM current_files)
         """)
         
+        # Log final state
+        remaining_files = session.execute("SELECT COUNT(*) FROM lucidlink_files").fetchone()[0]
+        logger.info(f"Files remaining after cleanup: {remaining_files}")
+        
         # Drop temporary table
         session.execute("DROP TABLE IF EXISTS current_files")
+        
+        # Return list of removed file IDs and paths
+        return [(row[0], row[1]) for row in removed_files]
         
     except Exception as e:
         logger.error(f"Cleanup failed: {str(e)}")
@@ -149,4 +173,50 @@ def get_database_stats(conn: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Failed to get database stats: {str(e)}")
+        raise
+
+def needs_schema_update(conn: duckdb.DuckDBPyConnection) -> bool:
+    """Check if the database needs a schema update by checking for required columns."""
+    try:
+        # Get column names from lucidlink_files table
+        result = conn.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'lucidlink_files'
+        """).fetchall()
+        columns = [row[0].lower() for row in result]
+        
+        # Check if relative_path column exists
+        return 'relative_path' not in columns
+        
+    except Exception as e:
+        logger.error(f"Error checking schema: {str(e)}")
+        # If there's an error (like table doesn't exist), assume we need an update
+        return True
+
+def reset_database(conn: duckdb.DuckDBPyConnection) -> None:
+    """Drop and recreate all tables."""
+    try:
+        conn.execute("DROP TABLE IF EXISTS lucidlink_files")
+        conn.execute("DROP TABLE IF EXISTS temp_batch")
+        
+        # Recreate tables with new schema
+        conn.execute("""
+            CREATE TABLE lucidlink_files (
+                id VARCHAR PRIMARY KEY,
+                name VARCHAR,
+                relative_path VARCHAR,
+                type VARCHAR,
+                size BIGINT,
+                creation_time TIMESTAMP,
+                update_time TIMESTAMP,
+                indexed_at TIMESTAMP,
+                error_count INTEGER DEFAULT 0,
+                last_error VARCHAR
+            );
+        """)
+        logger.info("Database tables reset successfully")
+        
+    except Exception as e:
+        logger.error(f"Error resetting database: {str(e)}")
         raise

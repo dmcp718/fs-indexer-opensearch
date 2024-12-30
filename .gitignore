@@ -48,3 +48,4 @@ run_logs/
 test_files/
 data/
 *.db
+prompts.txt
