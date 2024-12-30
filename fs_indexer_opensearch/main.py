@@ -632,6 +632,7 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
                 "_id": str(row['id']),  # Ensure ID is string
                 "_source": {
                     "name": path.basename(row['relative_path']),
+                    "extension": Path(row['relative_path']).suffix.lstrip('.'),
                     "relative_path": row['relative_path'],
                     "size_bytes": int(size),
                     "size": format_size(int(size)),

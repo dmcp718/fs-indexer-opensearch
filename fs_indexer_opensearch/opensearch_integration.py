@@ -56,6 +56,7 @@ class OpenSearchClient:
                 "properties": {
                     "filepath": {"type": "text"},
                     "name": {"type": "text"},
+                    "extension": {"type": "keyword"},
                     "size_bytes": {"type": "long"},
                     "size": {"type": "text"},
                     "modified_time": {"type": "date"},
@@ -163,7 +164,7 @@ class OpenSearchClient:
                 bulk_data.append({
                     "delete": {
                         "_index": self.index_name,
-                        "_id": file['id']
+                        "_id": file.get('id')
                     }
                 })
             
@@ -222,7 +223,7 @@ class OpenSearchClient:
                 batch.append({
                     "_op_type": "delete",
                     "_index": self.index_name,
-                    "_id": doc['_id']
+                    "_id": doc.get('_id')
                 })
                 
                 if len(batch) >= batch_size:
@@ -300,17 +301,18 @@ class OpenSearchClient:
     def _create_document(self, file_data: Dict) -> Dict:
         """Create an OpenSearch document from file data."""
         doc = {
-            "filepath": file_data["relative_path"],
-            "name": file_data["name"],
-            "size_bytes": file_data["size"],
-            "size": file_data["size"],
+            "filepath": file_data.get("relative_path"),
+            "name": file_data.get("name"),
+            "extension": file_data.get("extension"),
+            "size_bytes": file_data.get("size", 0),  # Default to 0 if size is missing
+            "size": file_data.get("size", 0),  # Default to 0 if size is missing
             "modified_time": datetime.fromtimestamp(
-                file_data["update_time"] / 1e9, tz=tz.tzutc()
+                file_data.get("update_time", 0) / 1e9, tz=tz.tzutc()
             ).isoformat(),
             "creation_time": datetime.fromtimestamp(
-                file_data["create_time"] / 1e9, tz=tz.tzutc()
+                file_data.get("create_time", 0) / 1e9, tz=tz.tzutc()
             ).isoformat(),
-            "type": file_data["type"],
+            "type": file_data.get("type"),
             "indexed_time": datetime.now(tz=tz.tzutc()).isoformat(),
             "direct_link": file_data.get("direct_link")
         }

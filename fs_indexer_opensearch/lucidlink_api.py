@@ -249,7 +249,7 @@ class LucidLinkAPI:
             return False
             
     async def get_direct_link(self, file_path: str) -> str:
-        """Generate a direct link for a file."""
+        """Generate a direct link for a file or directory."""
         try:
             # Ensure path starts with / and remove any trailing slashes
             clean_path = "/" + file_path.strip('/')
