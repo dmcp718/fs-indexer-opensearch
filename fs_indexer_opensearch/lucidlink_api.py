@@ -65,16 +65,23 @@ class LucidLinkAPI:
         
     async def _make_request(self, path: str = "") -> Dict[str, Any]:
         """Make async HTTP request to the API with retries and rate limiting"""
-        url = f"{self.base_url}/{quote(path.lstrip('/'))}" if path else self.base_url
+        # Clean up path - remove leading/trailing slashes and normalize
+        clean_path = path.strip('/').replace('//', '/')
+        url = f"{self.base_url}/{quote(clean_path)}" if clean_path else self.base_url
         
         for attempt in range(self._retry_attempts):
             try:
                 async with self._request_semaphore:
                     async with self.session.get(url) as response:
+                        if response.status == 400:
+                            # Log the problematic path and skip it
+                            logger.warning(f"Skipping invalid path: {path}")
+                            return {'items': []}  # Return empty result
+                        response.raise_for_status()
                         data = await response.json()
                         logger.debug(f"API response for {path}: {data}")
                         return data
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except aiohttp.ClientError as e:
                 if attempt == self._retry_attempts - 1:
                     logger.error(f"API request failed for path {path}: {str(e)}")
                     raise
@@ -192,24 +199,36 @@ class LucidLinkAPI:
         skip_directories = skip_directories or []
         
         try:
-            # Get initial directory listing from root_path
-            data = await self._make_request(root_path if root_path else "")
-            if not data:
-                logger.error("No entries found in response")
-                return
-                
-            # Process each entry
-            for entry in data:
-                if entry['type'] == 'directory':
-                    if entry['name'] not in skip_directories:
-                        # Process directory
-                        yield entry
-                        # Recursively process contents using relative path
-                        next_path = f"{root_path}/{entry['name']}" if root_path else entry['name']
-                        async for item in self.traverse_filesystem(next_path, skip_directories):
-                            yield item
-                else:
-                    yield entry
+            # Clean up root path
+            if root_path:
+                root_path = root_path.strip('/')
+            
+            # Start from root if no path specified
+            current_path = root_path if root_path else ""
+            
+            # Get initial directory contents
+            contents = await self.get_directory_contents(current_path)
+            
+            for item in contents:
+                try:
+                    # Clean up item path
+                    item_path = item['name'].strip('/')
+                    
+                    # Skip if in skip patterns
+                    if skip_directories and any(pattern in item_path for pattern in skip_directories):
+                        logger.debug(f"Skipping {item_path} due to skip pattern")
+                        continue
+                        
+                    yield item
+                    
+                    # If directory, traverse recursively
+                    if item['type'] == 'directory':
+                        async for child in self.traverse_filesystem(item_path, skip_directories):
+                            yield child
+                            
+                except Exception as e:
+                    logger.error(f"Error processing item {item.get('name', 'unknown')}: {str(e)}")
+                    continue
                     
         except Exception as e:
             logger.error(f"Error traversing filesystem: {str(e)}")

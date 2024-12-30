@@ -36,7 +36,7 @@ opensearch:
   host: "localhost"
   port: 9200
   username: "admin"
-  password: "Rollerton2020!"
+  password: "EuroVegas2025!"
 
 # =============================================
 # Database configuration
@@ -136,8 +136,6 @@ skip_patterns:
     - env
     - .env
     - .lucid_audit
-    - "Godzilla_10K_tif"
-    - "Godzilla_2K"
-    - "test_files"
-    - "00_Media"
-    # - "Adobe_MAX"
+    # - test_files
+    # - Godzilla_10K_tif
+    # - Godzilla_2k

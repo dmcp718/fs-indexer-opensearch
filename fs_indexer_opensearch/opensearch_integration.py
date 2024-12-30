@@ -1,20 +1,22 @@
 from opensearchpy import OpenSearch, helpers
 import logging
-from typing import List
+from typing import List, Dict, Any
+import urllib3
 
 class OpenSearchClient:
     def __init__(self, host: str, port: int, username: str, password: str, index_name: str = "filesystem"):
+        """Initialize OpenSearch client"""
+        self.index_name = index_name
         self.client = OpenSearch(
-            hosts=[{"host": host, "port": port}],
+            hosts=[{'host': host, 'port': port}],
             http_auth=(username, password),
             use_ssl=False,
             verify_certs=False,
-            maxsize=50,
-            timeout=30,
-            max_retries=3,
+            ssl_show_warn=False,
+            timeout=300,  # 5 minutes
             retry_on_timeout=True,
+            max_retries=3
         )
-        self.index_name = index_name
         self._ensure_index_exists()
         logging.info(f"Connected to OpenSearch at {host}:{port}")
 
@@ -164,6 +166,131 @@ class OpenSearchClient:
             else:
                 logging.info(f"Bulk delete completed successfully - Deleted: {success} documents")
             
+        except Exception as e:
+            logging.error(f"Bulk delete failed: {str(e)}")
+            raise
+
+    def bulk_delete_files(self, files: List[Dict[str, Any]], batch_size: int = 1000) -> None:
+        """Delete files in bulk from OpenSearch"""
+        if not files:
+            return
+
+        total_files = len(files)
+        success_count = 0
+        failed_count = 0
+        
+        # Process in smaller batches to avoid overwhelming OpenSearch
+        for i in range(0, total_files, batch_size):
+            batch = files[i:i + batch_size]
+            bulk_data = []
+            
+            for file in batch:
+                bulk_data.append({
+                    "delete": {
+                        "_index": self.index_name,
+                        "_id": file['id']
+                    }
+                })
+            
+            try:
+                response = self.client.bulk(body=bulk_data, index=self.index_name)
+                if response.get('errors', False):
+                    # Count individual successes/failures
+                    for item in response['items']:
+                        if 'delete' in item and item['delete']['status'] in [200, 201]:
+                            success_count += 1
+                        else:
+                            failed_count += 1
+                            logging.warning(f"Failed to delete item: {item}")
+                else:
+                    success_count += len(batch)
+            except Exception as e:
+                logging.error(f"Error in bulk delete batch: {str(e)}")
+                failed_count += len(batch)
+                
+            # Log progress
+            logging.info(f"Bulk delete progress: {i + len(batch)}/{total_files} files processed")
+        
+        if failed_count > 0:
+            logging.warning(f"Bulk delete completed with some errors - Success: {success_count}, Failed: {failed_count}")
+        else:
+            logging.info(f"Bulk delete completed successfully - {success_count} files deleted")
+
+    def bulk_delete_by_query(self, query: Dict[str, Any]) -> None:
+        """Delete documents matching query in bulk"""
+        try:
+            # First get count
+            count = self.client.count(index=self.index_name, body={"query": query})
+            total = count.get('count', 0)
+            if total == 0:
+                logging.info("No documents to delete")
+                return
+
+            logging.info(f"Found {total} documents to delete")
+            
+            # Use scan to get all document IDs
+            docs = helpers.scan(
+                client=self.client,
+                index=self.index_name,
+                query={"query": query},
+                _source=False,  # Only get IDs
+                size=5000
+            )
+            
+            # Batch delete documents
+            batch_size = 5000
+            batch = []
+            success_count = 0
+            failed_count = 0
+            
+            for doc in docs:
+                batch.append({
+                    "_op_type": "delete",
+                    "_index": self.index_name,
+                    "_id": doc['_id']
+                })
+                
+                if len(batch) >= batch_size:
+                    try:
+                        success, failed = helpers.bulk(
+                            self.client,
+                            batch,
+                            chunk_size=batch_size,
+                            request_timeout=300,
+                            raise_on_error=False,
+                            raise_on_exception=False
+                        )
+                        success_count += success
+                        failed_count += failed
+                        logging.info(f"Deleted batch of {success} documents, {failed} failed. Progress: {success_count}/{total}")
+                    except Exception as e:
+                        logging.error(f"Error deleting batch: {str(e)}")
+                        failed_count += len(batch)
+                    batch = []
+            
+            # Delete remaining documents
+            if batch:
+                try:
+                    success, failed = helpers.bulk(
+                        self.client,
+                        batch,
+                        chunk_size=batch_size,
+                        request_timeout=300,
+                        raise_on_error=False,
+                        raise_on_exception=False
+                    )
+                    success_count += success
+                    failed_count += failed
+                    logging.info(f"Deleted final batch of {success} documents, {failed} failed. Total: {success_count}/{total}")
+                except Exception as e:
+                    logging.error(f"Error deleting final batch: {str(e)}")
+                    failed_count += len(batch)
+                    
+            if failed_count > 0:
+                logging.warning(f"Bulk delete completed with some failures - Success: {success_count}, Failed: {failed_count}")
+            else:
+                logging.info(f"Bulk delete completed successfully - Total deleted: {success_count}")
+                    
         except Exception as e:
             logging.error(f"Bulk delete failed: {str(e)}")
             raise

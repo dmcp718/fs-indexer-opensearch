@@ -20,9 +20,15 @@ from fs_indexer_opensearch.lucidlink_api import LucidLinkAPI
 from fs_indexer_opensearch.opensearch_integration import OpenSearchClient
 import urllib.parse
 import requests
+from opensearchpy import helpers
+import pandas as pd
+import uuid
 
 # Initialize basic logging first
 logger = logging.getLogger(__name__)
+
+# Define UUID namespace for consistent IDs
+NAMESPACE_DNS = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
 
 # Load configuration
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
@@ -135,20 +141,30 @@ class WorkflowStats:
 def should_skip_file(file_info: Dict[str, Any], skip_patterns: Dict[str, List[str]]) -> bool:
     """Check if a file should be skipped based on skip patterns."""
     filename = file_info['name'].split('/')[-1]
+    full_path = file_info['name']  # Use full path from API
+    
+    # Debug logging
+    logger.debug(f"Checking skip patterns for: {full_path} (type: {file_info['type']})")
+    
+    # Check directory patterns first
+    for dir_pattern in skip_patterns.get('directories', []):
+        # Remove leading/trailing slashes for consistent matching
+        dir_pattern = dir_pattern.strip('/')
+        clean_path = full_path.strip('/')
+        
+        # Skip if path starts with or equals the pattern
+        if clean_path.startswith(dir_pattern + '/') or clean_path == dir_pattern:
+            logger.debug(f"Skipping {full_path} due to directory pattern {dir_pattern}")
+            return True
     
     # Check file extensions
     for ext in skip_patterns.get('extensions', []):
         # Remove leading dot if present in the extension pattern
         ext = ext.lstrip('.')
         if filename.endswith(f".{ext}") or filename == ext:
+            logger.debug(f"Skipping {full_path} due to extension pattern {ext}")
             return True
-            
-    # Check directory patterns
-    if file_info['type'] == 'directory':
-        for dir_pattern in skip_patterns.get('directories', []):
-            if filename == dir_pattern or filename.startswith(f"{dir_pattern}/"):
-                return True
-                
+    
     return False
 
 def calculate_checksum(file_path: str, buffer_size: int = 131072) -> str:
@@ -374,6 +390,19 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
         max_workers = config.get('performance', {}).get('max_workers', 10)
         port = config.get('lucidlink_filespace', {}).get('port', 9778)
         
+        async def process_batch(session: duckdb.DuckDBPyConnection, batch: List[Dict], stats: WorkflowStats) -> None:
+            """Process a batch of files by inserting them into DuckDB."""
+            try:
+                processed = bulk_upsert_files(session, batch)
+                with stats.lock:
+                    stats.files_updated += processed
+                    
+            except Exception as e:
+                error_msg = f"Error processing batch: {str(e)}"
+                logger.error(error_msg)
+                with stats.lock:
+                    stats.add_error(error_msg)
+
         async def process_files_async():
             async with LucidLinkAPI(port=port, max_workers=max_workers) as api:
                 # Check API health first
@@ -394,9 +423,8 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                 files_in_batch = 0
                 skip_patterns = config.get('skip_patterns', {})
                 batch_size = config['performance']['batch_size']
-                now = datetime.now(timezone.utc)
                 
-                # Initialize OpenSearch client for deletions
+                # Initialize OpenSearch client for cleanup if needed
                 client = OpenSearchClient(
                     host=config['opensearch']['host'],
                     port=config['opensearch']['port'],
@@ -404,37 +432,47 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                     password=config['opensearch']['password']
                 )
                 
-                # Delete all documents under the root path first
-                logger.info(f"Cleaning up OpenSearch records under path: {relative_root_path}")
-                client.delete_by_path_prefix(relative_root_path)
-                
-                async for file_info in api.traverse_filesystem(root_path=relative_root_path, skip_directories=skip_patterns.get('directories', [])):
+                # Process files from LucidLink API using relative path
+                async for file_info in api.traverse_filesystem(relative_root_path):
                     try:
-                        logger.debug(f"Processing file info: {file_info}")
+                        # Debug log the file_info
+                        logger.debug(f"Processing file_info: {file_info}")
                         
-                        # Track current files for cleanup
-                        current_files.append({'id': file_info['id']})
+                        # Skip files based on patterns
+                        if should_skip_file(file_info, skip_patterns):
+                            with stats.lock:
+                                stats.files_skipped += 1
+                            continue
                         
-                        # Update stats based on type
+                        # Add file to batch - ensure we have the required fields
+                        if 'name' not in file_info:
+                            logger.warning(f"Skipping file_info without name: {file_info}")
+                            continue
+                            
+                        # Copy file_info to avoid modifying the original
+                        batch_item = file_info.copy()
+                        batch_item['relative_path'] = batch_item['name']
+                        batch_item['id'] = str(uuid.uuid5(NAMESPACE_DNS, batch_item['relative_path']))
+                        
+                        # Update stats
                         with stats.lock:
-                            if file_info.get('type') == 'directory':
+                            if batch_item['type'] == 'directory':
                                 stats.total_dirs += 1
                             else:
                                 stats.total_files += 1
-                                stats.total_size += file_info.get('size', 0)
+                                stats.total_size += batch_item.get('size', 0)
                         
-                        # Add to batch
-                        batch.append(file_info)
+                        batch.append(batch_item)
+                        current_files.append({'id': batch_item['id'], 'relative_path': batch_item['relative_path']})
                         files_in_batch += 1
                         
-                        # Process batch if full
+                        # Process batch if it reaches the size limit
                         if files_in_batch >= batch_size:
                             logger.info(f"Processing batch of {files_in_batch} items...")
-                            bulk_upsert_files(session, batch)
-                            with stats.lock:
-                                stats.files_updated += files_in_batch
+                            await process_batch(session, batch, stats)
                             batch = []
                             files_in_batch = 0
+                            
                     except Exception as e:
                         error_msg = f"Error processing file {file_info.get('name', 'unknown')}: {str(e)}"
                         logger.error(error_msg)
@@ -442,11 +480,10 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                             stats.add_error(error_msg)
                         continue
                 
-                # Process any remaining files in the final batch
-                if batch:
-                    bulk_upsert_files(session, batch)
-                    with stats.lock:
-                        stats.files_updated += files_in_batch
+                # Process remaining files in the last batch
+                if files_in_batch > 0:
+                    logger.info(f"Processing batch of {files_in_batch} items...")
+                    await process_batch(session, batch, stats)
                 
                 # Clean up items that no longer exist
                 logger.info("Cleaning up removed files...")
@@ -459,7 +496,7 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                         stats.removed_paths = removed_paths
                     logger.info(f"Removed {len(removed_files)} files from DuckDB")
                     
-                    # Delete from OpenSearch
+                    # Delete from OpenSearch only if files were removed
                     client = OpenSearchClient(
                         host=config['opensearch']['host'],
                         port=config['opensearch']['port'],
@@ -481,116 +518,153 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
             stats.add_error(error_msg)
         raise
 
+def clean_opensearch_records(client: OpenSearchClient, root_path: str) -> None:
+    """Clean up OpenSearch records under the given path"""
+    try:
+        logger.info(f"Cleaning up OpenSearch records under path: {root_path}")
+        # Use optimized bulk delete by query
+        query = {
+            "term": {
+                "root_path.keyword": root_path
+            }
+        }
+        client.bulk_delete_by_query(query)
+    except Exception as e:
+        logger.error(f"Error cleaning up OpenSearch records: {str(e)}")
+        raise
+
 def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str, Any]) -> None:
     """Send file data from DuckDB to OpenSearch."""
     logger.info("DuckDB indexing complete, sending data to OpenSearch...")
+    start_time = time.time()
     
-    from fs_indexer_opensearch.opensearch_integration import OpenSearchClient
-    
-    client = OpenSearchClient(
-        host=config['opensearch']['host'],
-        port=config['opensearch']['port'],
-        username=config['opensearch']['username'],
-        password=config['opensearch']['password']
-    )
-
-    # Initialize direct link API client
-    lucidlink_port = config['lucidlink_filespace'].get('port', 9778)
-    api_base_url = f"http://127.0.0.1:{lucidlink_port}"
-    
-    def get_direct_link(filepath: str, is_directory: bool = False) -> Optional[str]:
-        """Generate a direct link for a file using the LucidLink API."""
-        try:
-            # Remove leading slash and ensure proper path format
-            rel_path = filepath.lstrip("/")
-            
-            # API endpoint and parameters
-            endpoint = "fsEntry/direct-link"
-            params = {
-                "path": rel_path,
-                "isDirectory": is_directory
-            }
-            
-            # Make API request
-            response = requests.get(
-                f"{api_base_url}/{endpoint}",
-                params=params,
-                timeout=10
-            )
-            
-            # Raise for non-200 responses
-            response.raise_for_status()
-            
-            # Extract direct link from response
-            return response.json().get("result")
-            
-        except Exception as e:
-            logger.error(f"Error generating direct link for {filepath}: {str(e)}")
-            return None
-    
-    # First, get list of IDs to delete
-    delete_query = """
-        SELECT id FROM lucidlink_files
-        WHERE indexed_at < (
-            SELECT MAX(indexed_at)
+    try:
+        # Initialize OpenSearch client
+        client = OpenSearchClient(
+            host=config['opensearch']['host'],
+            port=config['opensearch']['port'],
+            username=config['opensearch']['username'],
+            password=config['opensearch']['password']
+        )
+        
+        # First check total records in DuckDB
+        count_query = """
+        SELECT COUNT(*) as total, 
+               SUM(CASE WHEN type = 'directory' THEN 1 ELSE 0 END) as directories,
+               SUM(CASE WHEN type = 'file' THEN 1 ELSE 0 END) as files
+        FROM lucidlink_files
+        WHERE indexed_at >= (
+            SELECT MAX(indexed_at) - INTERVAL 1 MINUTE
             FROM lucidlink_files
         )
-    """
-    to_delete = session.execute(delete_query).fetchall()
-    if to_delete:
-        delete_ids = [row[0] for row in to_delete]
-        logger.info(f"Deleting {len(delete_ids)} files from OpenSearch")
-        client.bulk_delete(delete_ids)
-    
-    # Read files from DuckDB in batches
-    batch_size = config['performance']['batch_size']
-    offset = 0
-    
-    while True:
-        # Get a batch of files from DuckDB
-        query = f"""
-            SELECT id, name, relative_path, type, size, creation_time, update_time
-            FROM lucidlink_files
-            ORDER BY id
-            LIMIT {batch_size} OFFSET {offset}
         """
-        results = session.execute(query).fetchall()
+        counts = session.execute(count_query).fetchone()
+        logger.info(f"DuckDB records - Total: {counts[0]:,}, Directories: {counts[1]:,}, Files: {counts[2]:,}")
         
-        if not results:
-            break
+        # Get all files from DuckDB
+        query = """
+        SELECT id, name, relative_path, relative_path as full_path, size, 
+               CASE WHEN type = 'directory' THEN true ELSE false END as is_directory,
+               NULL as checksum, '.' as root_path, update_time as last_modified,
+               type
+        FROM lucidlink_files
+        WHERE indexed_at >= (
+            SELECT MAX(indexed_at) - INTERVAL 1 MINUTE
+            FROM lucidlink_files
+        )
+        ORDER BY relative_path
+        """
+        result = session.execute(query).fetchdf()
+        total_docs = len(result)
+        
+        if total_docs == 0:
+            logger.info("No files to index in OpenSearch")
+            return
             
-        # Prepare bulk data for OpenSearch
-        bulk_data = []
-        for row in results:
-            # Generate direct link for the file
-            is_directory = row[3] == 'directory'  # row[3] is the type
-            direct_link = get_direct_link(row[2], is_directory)  # row[2] is the relative_path
+        # Log sample of records for debugging
+        logger.info(f"Sample of first 5 records:")
+        for _, row in result.head().iterrows():
+            logger.info(f"  {row['type']}: {row['relative_path']}")
             
-            # Map database fields to OpenSearch fields
+        logger.info(f"Preparing to index {total_docs:,} documents to OpenSearch...")
+        
+        # Convert DataFrame to list of dicts for bulk indexing
+        docs = []
+        for _, row in result.iterrows():
+            # Handle NaN values
+            size = row['size']
+            if pd.isna(size):
+                size = 0
+            
             doc = {
-                "filepath": row[2],  # relative_path
-                "name": os.path.basename(row[2]),  # Use basename of relative_path
-                "size_bytes": row[4],
-                "size": format_size(row[4]),  # Human readable size
-                "creation_time": row[5].isoformat(),
-                "modified_time": row[6].isoformat(),
-                "type": row[3],  # Use type instead of file_type
-                "indexed_time": datetime.now(timezone.utc).isoformat(),
-                "direct_link": direct_link
+                "_index": client.index_name,
+                "_id": str(row['id']),  # Ensure ID is string
+                "_source": {
+                    "file_name": row['name'],
+                    "relative_path": row['relative_path'],
+                    "full_path": row['full_path'],
+                    "size_bytes": int(size),
+                    "is_directory": bool(row['is_directory']),
+                    "checksum": row['checksum'] if pd.notnull(row['checksum']) else None,
+                    "root_path": row['root_path'],
+                    "last_modified": row['last_modified'].isoformat() if pd.notnull(row['last_modified']) else None
+                }
             }
+            docs.append(doc)
             
-            # Add the index action and document
-            bulk_data.extend([
-                {"index": {"_index": "filesystem", "_id": row[0]}},  # Use LucidLink ID
-                doc
-            ])
+        # Bulk index in larger batches for better performance
+        batch_size = 5000
+        total_indexed = 0
+        total_success = 0
+        total_failed = 0
         
-        if bulk_data:
-            # Send batch to OpenSearch
-            client.send_data(bulk_data)
-            logger.info(f"Sent batch of {len(results)} items to OpenSearch")
+        for i in range(0, len(docs), batch_size):
+            batch = docs[i:i + batch_size]
+            batch_start = time.time()
+            try:
+                success_count = 0
+                failed_count = 0
+                
+                # Process bulk response
+                response = helpers.bulk(
+                    client.client,
+                    batch,
+                    chunk_size=batch_size,
+                    request_timeout=300,
+                    raise_on_error=False,
+                    raise_on_exception=False
+                )
+                
+                # Response is (success_count, errors_list)
+                if isinstance(response, tuple):
+                    success_count = response[0]
+                    failed_count = len(response[1]) if len(response) > 1 and response[1] else 0
+                
+                total_success += success_count
+                total_failed += failed_count
+                total_indexed += len(batch)
+                
+                batch_time = time.time() - batch_start
+                docs_per_sec = len(batch) / batch_time
+                progress = (total_indexed / total_docs) * 100
+                
+                if failed_count > 0:
+                    logger.warning(f"Batch indexing completed with errors - Success: {success_count:,}, Failed: {failed_count:,}")
+                logger.info(f"Progress: {progress:.1f}% ({total_indexed:,}/{total_docs:,}) - {docs_per_sec:.0f} docs/sec")
+                
+            except Exception as e:
+                logger.error(f"Error indexing batch: {str(e)}")
+                total_failed += len(batch)
         
-        offset += batch_size
+        # Log final statistics
+        total_time = time.time() - start_time
+        avg_rate = total_docs / total_time
+        logger.info(f"OpenSearch indexing complete in {total_time:.1f}s ({avg_rate:.0f} docs/sec)")
+        logger.info(f"Total documents: {total_docs:,}, Success: {total_success:,}, Failed: {total_failed:,}")
+                
+    except Exception as e:
+        logger.error(f"Error sending data to OpenSearch: {str(e)}")
+        raise
 
 def format_size(size_bytes: int) -> str:
     """Convert size in bytes to human readable string."""
@@ -614,12 +688,12 @@ def log_workflow_summary(stats: WorkflowStats) -> None:
     logger.info("Indexer Summary:")
     logger.info(f"Time Elapsed:     {elapsed_time:.2f} seconds")
     logger.info(f"Processing Rate:  {processing_rate:.1f} files/second")
-    logger.info(f"Total Size:       {stats.total_size / (1024.0 ** 3):.4f} GB")
-    logger.info(f"Total Files:      {stats.total_files}")
-    logger.info(f"Total Dirs:       {stats.total_dirs}")
-    logger.info(f"Files Updated:    {stats.files_updated}")
-    logger.info(f"Files Skipped:    {stats.files_skipped}")
-    logger.info(f"Files Removed:    {stats.files_removed}")
+    logger.info(f"Total Size:       {format_size(stats.total_size)}")
+    logger.info(f"Total Files:      {stats.total_files:,}")
+    logger.info(f"Total Dirs:       {stats.total_dirs:,}")
+    logger.info(f"Items Updated:    {stats.files_updated:,}")
+    logger.info(f"Files Skipped:    {stats.files_skipped:,}")
+    logger.info(f"Files Removed:    {stats.files_removed:,}")
     logger.info(f"Total Errors:     {len(stats.errors)}")
     
     if stats.files_removed > 0:
@@ -637,6 +711,54 @@ def log_workflow_summary(stats: WorkflowStats) -> None:
 def get_database_stats(session: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
     """Get database statistics."""
     return get_database_stats(session)
+
+# Initialize direct link API client
+api_base_url = "http://localhost:9778"
+
+def get_direct_link(path: str, is_directory: bool = False) -> str:
+    """Get direct link for file/directory"""
+    # Clean up path - handle both absolute and relative paths
+    clean_path = path.strip('/')
+    if clean_path.startswith('Volumes/dmpfs/production/'):
+        clean_path = clean_path[len('Volumes/dmpfs/production/'):].strip('/')
+    
+    # Skip if path is empty
+    if not clean_path:
+        return ''
+    
+    try:
+        # Disable proxy for local requests
+        session = requests.Session()
+        session.trust_env = False  # Don't use environment proxies
+        
+        # Use proven endpoint and parameters
+        endpoint = "fsEntry/direct-link"
+        params = {
+            "path": clean_path,
+            "isDirectory": is_directory
+        }
+        
+        response = session.get(
+            f"{api_base_url}/{endpoint}",
+            params=params,
+            timeout=10
+        )
+        
+        # Handle 404s gracefully
+        if response.status_code == 404:
+            logger.debug(f"Path not found: {clean_path}")
+            return ''
+            
+        response.raise_for_status()
+        
+        # Extract direct link from result field
+        return response.json().get("result", "")
+            
+    except Exception as e:
+        logger.warning(f"Failed to get direct link for {path}: {str(e)}")
+        return ''
+    finally:
+        session.close()
 
 def main():
     """Main entry point."""
