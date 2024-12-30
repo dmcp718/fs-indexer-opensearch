@@ -248,6 +248,41 @@ class LucidLinkAPI:
             logger.error(f"LucidLink API health check failed: {str(e)}")
             return False
             
+    async def get_direct_link(self, file_path: str) -> str:
+        """Generate a direct link for a file."""
+        try:
+            # Ensure path starts with / and remove any trailing slashes
+            clean_path = "/" + file_path.strip('/')
+            
+            # API endpoint and parameters with proper URL encoding
+            endpoint = "fsEntry/direct-link"
+            params = {
+                "path": clean_path  # aiohttp will handle URL encoding properly
+            }
+            
+            url = f"{self.base_url.replace('/files', '')}/{endpoint}"
+            logger.debug(f"Requesting direct link for path: {clean_path}")
+            
+            async with self._request_semaphore:
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 400:
+                        logger.warning(f"Failed to generate direct link for: {file_path} - Bad Request")
+                        return None
+                    
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    # Extract the 'result' field
+                    if 'result' not in data:
+                        logger.warning(f"No result field in response for: {file_path}")
+                        return None
+                        
+                    return data['result']
+                    
+        except Exception as e:
+            logger.error(f"Error generating direct link for {file_path}: {str(e)}")
+            return None
+
     def get_all_files(self) -> List[Dict[str, Any]]:
         """Get all files and directories that were traversed"""
         return self._all_files

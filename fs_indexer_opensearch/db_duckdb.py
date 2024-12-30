@@ -8,6 +8,8 @@ from typing import Dict, List, Any, Tuple
 import pandas as pd
 from dateutil import tz
 import pytz
+import uuid
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +28,10 @@ def init_database(db_url: str) -> duckdb.DuckDBPyConnection:
             relative_path VARCHAR,
             type VARCHAR,
             size BIGINT,
-            creation_time TIMESTAMP,
-            update_time TIMESTAMP,
-            indexed_at TIMESTAMP,
+            creation_time TIMESTAMP WITH TIME ZONE,
+            update_time TIMESTAMP WITH TIME ZONE,
+            direct_link VARCHAR,
+            indexed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             error_count INTEGER DEFAULT 0,
             last_error VARCHAR
         );
@@ -38,28 +41,13 @@ def init_database(db_url: str) -> duckdb.DuckDBPyConnection:
 
 def bulk_upsert_files(conn: duckdb.DuckDBPyConnection, files_batch: List[Dict[str, Any]]) -> int:
     """Perform optimized bulk upsert of files using DuckDB."""
-    if not files_batch:
-        return 0
-        
     try:
-        # Create temporary table for batch data
-        conn.execute("""
-            CREATE TEMPORARY TABLE IF NOT EXISTS temp_batch (
-                id VARCHAR PRIMARY KEY,
-                name VARCHAR,
-                relative_path VARCHAR,
-                type VARCHAR,
-                size BIGINT,
-                creation_time TIMESTAMP,
-                update_time TIMESTAMP,
-                indexed_at TIMESTAMP,
-                error_count INTEGER,
-                last_error VARCHAR
-            );
-        """)
+        if not files_batch:
+            return 0
+
+        now = datetime.now(pytz.utc)
         
         # Convert timestamps and prepare data
-        now = datetime.now(pytz.utc)
         df = pd.DataFrame([{
             'id': f['id'],
             'name': f['name'],  # Use name from API
@@ -68,10 +56,13 @@ def bulk_upsert_files(conn: duckdb.DuckDBPyConnection, files_batch: List[Dict[st
             'size': f.get('size', 0),
             'creation_time': datetime.fromtimestamp(f['creationTime'] / 1e9, tz=pytz.utc),
             'update_time': datetime.fromtimestamp(f['updateTime'] / 1e9, tz=pytz.utc),
+            'direct_link': f.get('direct_link', None),
             'indexed_at': now,
             'error_count': 0,
             'last_error': None
         } for f in files_batch])
+        
+        logger.debug(f"Prepared DataFrame for DuckDB: {df.head()}")
         
         # Register DataFrame and perform upsert
         conn.register("batch_df", df)
@@ -81,8 +72,7 @@ def bulk_upsert_files(conn: duckdb.DuckDBPyConnection, files_batch: List[Dict[st
             SELECT * FROM batch_df
         """)
         
-        # Drop temporary table
-        conn.execute("DROP TABLE IF EXISTS temp_batch")
+        logger.info(f"Bulk upserted {len(files_batch)} records into DuckDB")
         
         return len(files_batch)
         
@@ -130,6 +120,8 @@ def cleanup_missing_files(session: duckdb.DuckDBPyConnection, current_files: Lis
             DELETE FROM lucidlink_files
             WHERE id NOT IN (SELECT id FROM current_files)
         """)
+        
+        logger.info(f"Deleted {len(removed_files)} files from database")
         
         # Log final state
         remaining_files = session.execute("SELECT COUNT(*) FROM lucidlink_files").fetchone()[0]
@@ -186,8 +178,8 @@ def needs_schema_update(conn: duckdb.DuckDBPyConnection) -> bool:
         """).fetchall()
         columns = [row[0].lower() for row in result]
         
-        # Check if relative_path column exists
-        return 'relative_path' not in columns
+        # Check if relative_path and direct_link columns exist
+        return 'relative_path' not in columns or 'direct_link' not in columns
         
     except Exception as e:
         logger.error(f"Error checking schema: {str(e)}")
@@ -208,9 +200,10 @@ def reset_database(conn: duckdb.DuckDBPyConnection) -> None:
                 relative_path VARCHAR,
                 type VARCHAR,
                 size BIGINT,
-                creation_time TIMESTAMP,
-                update_time TIMESTAMP,
-                indexed_at TIMESTAMP,
+                creation_time TIMESTAMP WITH TIME ZONE,
+                update_time TIMESTAMP WITH TIME ZONE,
+                direct_link VARCHAR,
+                indexed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 error_count INTEGER DEFAULT 0,
                 last_error VARCHAR
             );

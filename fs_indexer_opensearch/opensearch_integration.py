@@ -2,6 +2,8 @@ from opensearchpy import OpenSearch, helpers
 import logging
 from typing import List, Dict, Any
 import urllib3
+from datetime import datetime
+from dateutil import tz
 
 class OpenSearchClient:
     def __init__(self, host: str, port: int, username: str, password: str, index_name: str = "filesystem"):
@@ -22,6 +24,14 @@ class OpenSearchClient:
 
     def _ensure_index_exists(self):
         """Ensure the index exists with proper mapping."""
+        mapping = self._create_index_mapping()
+        
+        if not self.client.indices.exists(index=self.index_name):
+            self.client.indices.create(index=self.index_name, body=mapping)
+            logging.info(f"Created index {self.index_name} with mapping")
+
+    def _create_index_mapping(self):
+        """Create the index mapping for filesystem data."""
         mapping = {
             "settings": {
                 "number_of_shards": 1,
@@ -30,68 +40,33 @@ class OpenSearchClient:
                 "analysis": {
                     "analyzer": {
                         "path_analyzer": {
-                            "tokenizer": "path_hierarchy",
-                            "char_filter": ["path_special_chars"],
-                            "filter": ["lowercase", "word_delimiter_graph"]
-                        },
-                        "name_analyzer": {
-                            "tokenizer": "standard",
-                            "char_filter": ["name_special_chars"],
-                            "filter": ["lowercase", "word_delimiter_graph"]
+                            "tokenizer": "path_tokenizer",
+                            "filter": ["lowercase"]
                         }
                     },
-                    "char_filter": {
-                        "path_special_chars": {
-                            "type": "pattern_replace",
-                            "pattern": "[_.]",
-                            "replacement": " "
-                        },
-                        "name_special_chars": {
-                            "type": "pattern_replace",
-                            "pattern": "[_.]",
-                            "replacement": " "
+                    "tokenizer": {
+                        "path_tokenizer": {
+                            "type": "pattern",
+                            "pattern": "[/\\\\]"
                         }
                     }
                 }
             },
             "mappings": {
                 "properties": {
-                    "filepath": {
-                        "type": "text",
-                        "analyzer": "path_analyzer",
-                        "fields": {
-                            "keyword": {"type": "keyword"}
-                        }
-                    },
-                    "name": {
-                        "type": "text",
-                        "analyzer": "name_analyzer",
-                        "fields": {
-                            "keyword": {"type": "keyword"}
-                        }
-                    },
+                    "filepath": {"type": "text"},
+                    "name": {"type": "text"},
                     "size_bytes": {"type": "long"},
-                    "size": {"type": "keyword"},
+                    "size": {"type": "long"},
                     "modified_time": {"type": "date"},
                     "creation_time": {"type": "date"},
                     "type": {"type": "keyword"},
                     "indexed_time": {"type": "date"},
-                    "direct_link": {
-                        "type": "keyword",
-                        "meta": {
-                            "fieldType": "string",
-                            "openLinkInNewTab": "false",
-                            "labelTemplate": "link to asset",
-                            "urlTemplate": "{{value}}"
-                        }
-                    }
+                    "direct_link": {"type": "keyword", "null_value": "NULL"}
                 }
             }
         }
-        
-        if not self.client.indices.exists(index=self.index_name):
-            self.client.indices.create(index=self.index_name, body=mapping)
-            logging.info(f"Created index {self.index_name} with mapping")
+        return mapping
 
     def send_data(self, data: list):
         try:
@@ -321,3 +296,22 @@ class OpenSearchClient:
         except Exception as e:
             logging.error(f"Failed to delete documents by path prefix: {str(e)}")
             raise
+
+    def _create_document(self, file_data: Dict) -> Dict:
+        """Create an OpenSearch document from file data."""
+        doc = {
+            "filepath": file_data["relative_path"],
+            "name": file_data["name"],
+            "size_bytes": file_data["size"],
+            "size": file_data["size"],
+            "modified_time": datetime.fromtimestamp(
+                file_data["update_time"] / 1e9, tz=tz.tzutc()
+            ).isoformat(),
+            "creation_time": datetime.fromtimestamp(
+                file_data["create_time"] / 1e9, tz=tz.tzutc()
+            ).isoformat(),
+            "type": file_data["type"],
+            "indexed_time": datetime.now(tz=tz.tzutc()).isoformat(),
+            "direct_link": file_data.get("direct_link")
+        }
+        return doc

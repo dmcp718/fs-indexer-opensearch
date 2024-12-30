@@ -390,9 +390,39 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
         max_workers = config.get('performance', {}).get('max_workers', 10)
         port = config.get('lucidlink_filespace', {}).get('port', 9778)
         
-        async def process_batch(session: duckdb.DuckDBPyConnection, batch: List[Dict], stats: WorkflowStats) -> None:
+        async def process_batch(session: duckdb.DuckDBPyConnection, batch: List[Dict], stats: WorkflowStats, lucidlink_api: LucidLinkAPI) -> None:
             """Process a batch of files by inserting them into DuckDB."""
             try:
+                # Generate direct links for files in parallel
+                direct_link_tasks = []
+                logger.info(f"Processing batch of {len(batch)} items for direct links")
+                for item in batch:
+                    if item['type'] != 'directory':  # Only generate links for files
+                        logger.debug(f"Generating direct link for: {item['relative_path']}")
+                        task = lucidlink_api.get_direct_link(item['relative_path'])
+                        direct_link_tasks.append(task)
+                    else:
+                        direct_link_tasks.append(None)
+                        
+                # Wait for all direct link generations
+                if direct_link_tasks:
+                    logger.info(f"Waiting for {len([t for t in direct_link_tasks if t is not None])} direct link tasks")
+                    direct_links = await asyncio.gather(*[t for t in direct_link_tasks if t is not None], return_exceptions=True)
+                    
+                    # Add direct links to batch items
+                    link_idx = 0
+                    for i, item in enumerate(batch):
+                        if item['type'] != 'directory':
+                            if isinstance(direct_links[link_idx], Exception):
+                                logger.error(f"Failed to generate direct link for {item['relative_path']}: {direct_links[link_idx]}")
+                                item['direct_link'] = None
+                            else:
+                                logger.debug(f"Got direct link for {item['relative_path']}: {direct_links[link_idx]}")
+                                item['direct_link'] = direct_links[link_idx]
+                            link_idx += 1
+                        else:
+                            item['direct_link'] = None
+                
                 processed = bulk_upsert_files(session, batch)
                 with stats.lock:
                     stats.files_updated += processed
@@ -404,9 +434,9 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                     stats.add_error(error_msg)
 
         async def process_files_async():
-            async with LucidLinkAPI(port=port, max_workers=max_workers) as api:
+            async with LucidLinkAPI(port=port, max_workers=max_workers) as lucidlink_api:
                 # Check API health first
-                if not await api.health_check():
+                if not await lucidlink_api.health_check():
                     raise RuntimeError("LucidLink API is not available")
                 
                 logger.info("Starting filesystem traversal...")
@@ -433,7 +463,7 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                 )
                 
                 # Process files from LucidLink API using relative path
-                async for file_info in api.traverse_filesystem(relative_root_path):
+                async for file_info in lucidlink_api.traverse_filesystem(relative_root_path):
                     try:
                         # Debug log the file_info
                         logger.debug(f"Processing file_info: {file_info}")
@@ -469,7 +499,7 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                         # Process batch if it reaches the size limit
                         if files_in_batch >= batch_size:
                             logger.info(f"Processing batch of {files_in_batch} items...")
-                            await process_batch(session, batch, stats)
+                            await process_batch(session, batch, stats, lucidlink_api)
                             batch = []
                             files_in_batch = 0
                             
@@ -483,7 +513,7 @@ def process_lucidlink_files(session: duckdb.DuckDBPyConnection, stats: WorkflowS
                 # Process remaining files in the last batch
                 if files_in_batch > 0:
                     logger.info(f"Processing batch of {files_in_batch} items...")
-                    await process_batch(session, batch, stats)
+                    await process_batch(session, batch, stats, lucidlink_api)
                 
                 # Clean up items that no longer exist
                 logger.info("Cleaning up removed files...")
@@ -566,7 +596,7 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
         SELECT id, name, relative_path, relative_path as full_path, size, 
                CASE WHEN type = 'directory' THEN true ELSE false END as is_directory,
                NULL as checksum, '.' as root_path, update_time as last_modified,
-               type
+               type, direct_link
         FROM lucidlink_files
         WHERE indexed_at >= (
             SELECT MAX(indexed_at) - INTERVAL 1 MINUTE
@@ -607,7 +637,8 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
                     "is_directory": bool(row['is_directory']),
                     "checksum": row['checksum'] if pd.notnull(row['checksum']) else None,
                     "root_path": row['root_path'],
-                    "last_modified": row['last_modified'].isoformat() if pd.notnull(row['last_modified']) else None
+                    "last_modified": row['last_modified'].isoformat() if pd.notnull(row['last_modified']) else None,
+                    "direct_link": row['direct_link'] if pd.notnull(row['direct_link']) else None
                 }
             }
             docs.append(doc)
@@ -713,52 +744,12 @@ def get_database_stats(session: duckdb.DuckDBPyConnection) -> Dict[str, Any]:
     return get_database_stats(session)
 
 # Initialize direct link API client
-api_base_url = "http://localhost:9778"
+def get_api_base_url(config: Dict[str, Any]) -> str:
+    """Get API base URL using port from configuration."""
+    port = config.get('lucidlink_filespace', {}).get('port', 9778)  # Default to 9778 if not specified
+    return f"http://localhost:{port}"
 
-def get_direct_link(path: str, is_directory: bool = False) -> str:
-    """Get direct link for file/directory"""
-    # Clean up path - handle both absolute and relative paths
-    clean_path = path.strip('/')
-    if clean_path.startswith('Volumes/dmpfs/production/'):
-        clean_path = clean_path[len('Volumes/dmpfs/production/'):].strip('/')
-    
-    # Skip if path is empty
-    if not clean_path:
-        return ''
-    
-    try:
-        # Disable proxy for local requests
-        session = requests.Session()
-        session.trust_env = False  # Don't use environment proxies
-        
-        # Use proven endpoint and parameters
-        endpoint = "fsEntry/direct-link"
-        params = {
-            "path": clean_path,
-            "isDirectory": is_directory
-        }
-        
-        response = session.get(
-            f"{api_base_url}/{endpoint}",
-            params=params,
-            timeout=10
-        )
-        
-        # Handle 404s gracefully
-        if response.status_code == 404:
-            logger.debug(f"Path not found: {clean_path}")
-            return ''
-            
-        response.raise_for_status()
-        
-        # Extract direct link from result field
-        return response.json().get("result", "")
-            
-    except Exception as e:
-        logger.warning(f"Failed to get direct link for {path}: {str(e)}")
-        return ''
-    finally:
-        session.close()
+api_base_url = None  # Will be initialized in main()
 
 def main():
     """Main entry point."""
@@ -774,6 +765,10 @@ def main():
         # Override root path if provided
         if args.root_path:
             config['root_path'] = args.root_path
+
+        # Initialize API base URL
+        global api_base_url
+        api_base_url = get_api_base_url(config)
 
         # Configure logging
         configure_logging(config)
