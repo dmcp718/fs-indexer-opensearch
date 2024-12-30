@@ -57,7 +57,7 @@ class OpenSearchClient:
                     "filepath": {"type": "text"},
                     "name": {"type": "text"},
                     "size_bytes": {"type": "long"},
-                    "size": {"type": "long"},
+                    "size": {"type": "text"},
                     "modified_time": {"type": "date"},
                     "creation_time": {"type": "date"},
                     "type": {"type": "keyword"},

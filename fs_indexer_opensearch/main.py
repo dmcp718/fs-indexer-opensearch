@@ -3,6 +3,7 @@
 import logging
 import logging.handlers
 import os
+from os import path
 import sys
 import time
 import argparse
@@ -630,13 +631,12 @@ def send_data_to_opensearch(session: duckdb.DuckDBPyConnection, config: Dict[str
                 "_index": client.index_name,
                 "_id": str(row['id']),  # Ensure ID is string
                 "_source": {
-                    "file_name": row['name'],
+                    "name": path.basename(row['relative_path']),
                     "relative_path": row['relative_path'],
-                    "full_path": row['full_path'],
                     "size_bytes": int(size),
+                    "size": format_size(int(size)),
                     "is_directory": bool(row['is_directory']),
                     "checksum": row['checksum'] if pd.notnull(row['checksum']) else None,
-                    "root_path": row['root_path'],
                     "last_modified": row['last_modified'].isoformat() if pd.notnull(row['last_modified']) else None,
                     "direct_link": row['direct_link'] if pd.notnull(row['direct_link']) else None
                 }
